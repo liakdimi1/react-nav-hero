@@ -36,6 +36,12 @@ def message(text="Hello", number=1, chat_id=42, business=False):
     return {"business_message" if business else "message": value}
 
 
+def admin_control(update, receipt_id=None):
+    """Exercise control behavior with a configured admin, not client privileges."""
+    with patch.object(bot, "BOT_ADMIN_USER_ID", update["message"]["from"]["id"]):
+        return bot.process_message(update, receipt_id)
+
+
 def qualified():
     return bot.merge_profile_update(bot.empty_profile(), {
         "age": 25, "name": "Alex", "general_location": "Athens", "interests": ["music"],
@@ -95,10 +101,10 @@ class BotTests(unittest.TestCase):
         bot.chat_state("direct-test:42")
         self.execute("UPDATE conversation_state SET transcript=? WHERE conversation_key=?",
                      (json.dumps([{"role": "user", "content": "old context"}]), "direct-test:42"))
-        bot.process_message(message("/stop"))
+        admin_control(message("/stop"))
         self.assertEqual(bot.chat_state("direct-test:42")["transcript"], "[]")
         bot.scheduler = bot.ReplyScheduler()  # Restart loses all in-memory state.
-        bot.process_message(message("/start", 2))
+        admin_control(message("/start", 2))
         self.assertFalse(bot.paused("direct-test:42"))
         bot.process_message(message("Hi again", 3))
         self.assertEqual(bot.scheduler.pending["direct-test:42"][0].text, "Hi again")
@@ -106,7 +112,7 @@ class BotTests(unittest.TestCase):
     def test_start_does_not_bypass_human_review(self):
         bot.chat_state("direct-test:42")
         self.execute("UPDATE conversation_state SET phase='manual_review' WHERE conversation_key='direct-test:42'")
-        bot.process_message(message("/start"))
+        admin_control(message("/start"))
         self.assertTrue(bot.paused("direct-test:42"))
 
     def test_forget_removes_profile_identity_jobs_inbox_and_history(self):
@@ -114,7 +120,7 @@ class BotTests(unittest.TestCase):
         bot.save_client_profile(job.key, qualified())
         bot.cache_history(job.key, [{"role": "user", "content": "old"}])
         bot.enqueue_update(message("queued data", 2))
-        bot.process_message(message("/forget", 3))
+        admin_control(message("/forget", 3))
         self.assertTrue(job.cancelled.is_set())
         self.assertFalse(self.rows("SELECT * FROM client_profiles"))
         self.assertFalse(self.rows("SELECT * FROM client_identities"))
@@ -122,7 +128,7 @@ class BotTests(unittest.TestCase):
         self.assertEqual(self.rows("SELECT DISTINCT payload FROM incoming_updates"), [("",)])
         self.assertNotIn(job.key, bot.histories)
         self.assertTrue(bot.paused(job.key))
-        bot.process_message(message("/start", 4))
+        admin_control(message("/start", 4))
         self.assertFalse(bot.paused(job.key))
 
     def test_admin_resume_resets_limits_and_pause(self):
@@ -150,7 +156,7 @@ class BotTests(unittest.TestCase):
         self.model.return_value = response("I'm NidumAI, your assistant.")
         answer = bot.ai_reply([], "Who are you?", bot.empty_profile())
         self.assertIn("Ginger", answer)
-        self.assertIn("fictional AI", answer)
+        self.assertEqual(answer, "You've got my attention 😌, i am Ginger")
         self.assertNotIn("Nidum", answer)
         self.assertEqual(self.model.call_count, 2)
 
@@ -286,7 +292,7 @@ class BotTests(unittest.TestCase):
         job = self.schedule()
         with patch.object(bot, "PROFILE_EXTRACTION_ENABLED", True), patch.object(bot, "extract_profile_update") as extract:
             def forget_while_extracting(*args):
-                bot.process_message(message("/forget", 2))
+                admin_control(message("/forget", 2))
                 return {"name": "should not be saved"}
             extract.side_effect = forget_while_extracting
             bot.perform_reply(job)
@@ -329,7 +335,7 @@ class BotTests(unittest.TestCase):
         self.assertNotIn("person@example.com", self.rows("SELECT data FROM reply_jobs")[0][0])
         bot.perform_reply(job)
         self.assertEqual(self.send.call_args.args[2], "I’m Ginger. Nice to meet you!")
-        self.assertNotIn(bot.PRIVACY_NOTICE, bot.chat_state(job.key)["transcript"])
+        self.assertNotIn("AI services process these messages", bot.chat_state(job.key)["transcript"])
 
     def test_retention_removes_stale_profiles_and_work(self):
         job = self.schedule(); bot.save_client_profile(job.key, qualified())
@@ -395,11 +401,11 @@ class BotTests(unittest.TestCase):
         bot.enqueue_update(message("/stop", 1))
         bot.enqueue_update(message("/start", 2))
         receipt, payload = self.rows("SELECT receipt_id,payload FROM incoming_updates ORDER BY rowid LIMIT 1")[0]
-        bot.process_message(json.loads(payload), receipt)
+        admin_control(json.loads(payload), receipt)
         rows = self.rows("SELECT receipt_id,payload FROM incoming_updates WHERE status='queued'")
         self.assertEqual(len(rows), 1)
         self.assertEqual(json.loads(rows[0][1])["message"]["text"], "/start")
-        bot.process_message(json.loads(rows[0][1]), rows[0][0])
+        admin_control(json.loads(rows[0][1]), rows[0][0])
         self.assertFalse(bot.paused("direct-test:42"))
 
     def test_legacy_database_migration_preserves_profiles(self):
@@ -428,7 +434,7 @@ class BotTests(unittest.TestCase):
         reply = threading.Thread(target=lambda: run(lambda: bot.perform_reply(job)))
         reply.start()
         self.assertTrue(entered.wait(2))
-        forget = threading.Thread(target=lambda: run(lambda: bot.process_message(message("/forget", 2))))
+        forget = threading.Thread(target=lambda: run(lambda: admin_control(message("/forget", 2))))
         forget.start()
         release.set()
         reply.join(2); forget.join(2)
@@ -659,22 +665,21 @@ print('HTTP worker integration passed')
 
 
     def test_start_has_no_automatic_privacy_notice(self):
-        bot.process_message(message("/start"))
-        self.send.assert_called_once_with(None, 42, "I’m Ginger. We can chat again.")
+        admin_control(message("/start"))
+        self.send.assert_not_called()
 
     def test_privacy_details_are_available_only_on_request(self):
-        bot.process_message(message("/privacy"))
-        self.assertIn(bot.PRIVACY_NOTICE, self.send.call_args.args[2])
+        admin_control(message("/privacy"))
+        self.assertIn("Notes expire after", self.send.call_args.args[2])
         self.assertIn("copies already sent", self.send.call_args.args[2])
 
-    def test_ready_legacy_reply_recovery_removes_automatic_notice(self):
+    def test_ready_reply_recovery_preserves_answer_without_automatic_notice(self):
         job = self.schedule()
         bot.prepare_answer(job)
-        job.answer = bot.PRIVACY_NOTICE + "\n\n" + "Hello again!"
+        job.answer = "Hello again!"
         with bot.profile_db() as db:
             bot.persist_job(db, job)
-            # An existing deployment may still have this unused legacy column.
-            db.execute("ALTER TABLE conversation_state ADD COLUMN privacy_notified INTEGER NOT NULL DEFAULT 0")
+
         bot.initialize_storage()
         bot.scheduler = bot.ReplyScheduler()
         bot.scheduler.restore()
@@ -683,7 +688,86 @@ print('HTTP worker integration passed')
         bot.perform_reply(recovered)
         self.model.assert_not_called()
         self.send.assert_called_once_with(None, 42, "Hello again!")
-        self.assertNotIn(bot.PRIVACY_NOTICE, bot.chat_state(job.key)["transcript"])
+        self.assertNotIn("AI services process these messages", bot.chat_state(job.key)["transcript"])
+
+
+    def test_generated_answer_and_turn_are_persisted_before_send(self):
+        job = self.schedule()
+        bot.prepare_answer(job)
+        self.assertEqual(job.answer, "I’m Ginger. Nice to meet you!")
+        self.assertEqual(job.status, "ready")
+        status, data = self.rows("SELECT status,data FROM reply_jobs WHERE job_id=?", (job.job_id,))[0]
+        self.assertEqual(status, "ready")
+        self.assertEqual(json.loads(data)["answer"], job.answer)
+        self.assertEqual(bot.chat_state(job.key)["local_count"], 1)
+        self.send.assert_not_called()
+
+    def test_admin_start_is_silent_with_direct_test_mode_disabled(self):
+        key = "direct-test:99"
+        bot.chat_state(key)
+        self.execute("UPDATE conversation_state SET phase='stopped' WHERE conversation_key=?", (key,))
+        with patch.object(bot, "ENABLE_DIRECT_TEST_MODE", False):
+            bot.process_message(message("/start", chat_id=99))
+        self.assertEqual(bot.chat_state(key)["phase"], "profiling")
+        self.send.assert_not_called()
+
+    def test_admin_controls_work_with_direct_test_mode_disabled(self):
+        with patch.object(bot, "ENABLE_DIRECT_TEST_MODE", False):
+            bot.process_message(message("/stop", chat_id=99))
+            self.assertTrue(bot.paused("direct-test:99"))
+            bot.process_message(message("/privacy", 2, chat_id=99))
+            self.assertIn("Notes expire", self.send.call_args.args[2])
+            bot.process_message(message("/forget", 3, chat_id=99))
+            self.assertTrue(bot.paused("direct-test:99"))
+        self.assertEqual(self.send.call_count, 3)
+
+    def test_clients_cannot_execute_any_commands(self):
+        for command in ("/start", "/stop", "/forget", "/privacy", "/export_profiles", "/resume_profile biz:42", "/profile @alex", "profile:alex"):
+            for business in (False, True):
+                with self.subTest(command=command, business=business):
+                    bot.process_message(message(command, business=business))
+        self.send.assert_not_called()
+        self.model.assert_not_called()
+        self.assertFalse(self.rows("SELECT * FROM conversation_state"))
+        self.assertFalse(bot.scheduler.pending)
+
+    def test_admin_commands_are_restricted_to_private_bot_chat(self):
+        private = message("/stop", chat_id=99)
+        private["message"]["chat"]["type"] = "group"
+        bot.process_message(private)
+        bot.process_message(message("/stop", chat_id=99, business=True))
+        self.assertFalse(self.rows("SELECT * FROM conversation_state"))
+        self.send.assert_not_called()
+
+    def test_normal_business_client_message_still_schedules_with_direct_mode_off(self):
+        connection = {"user":{"id":99},"is_enabled":True,"rights":{"can_reply":True}}
+        with patch.object(bot,"ENABLE_DIRECT_TEST_MODE",False), patch.object(bot,"telegram",return_value=connection):
+            bot.process_message(message("Hello Ginger", business=True))
+        self.assertEqual(bot.scheduler.pending["biz:42"][0].text,"Hello Ginger")
+        self.send.assert_not_called()
+
+    def test_freeform_employment_matches_user_prompt_and_requires_evidence(self):
+        self.model.return_value = response('{"profile_update":{"employment_status":"part-time barista","employment_evidence":"I work part-time in a cafe"}}')
+        update = bot.extract_profile_update("I work part-time in a cafe",bot.empty_profile())
+        profile = bot.merge_profile_update(bot.empty_profile(),update)
+        self.assertEqual(profile["employment_status"],"part-time barista")
+        update = bot.extract_profile_update("I study chemistry",bot.empty_profile())
+        self.assertNotIn("employment_status",update)
+
+    def test_uploaded_prompt_source_is_unchanged(self):
+        import ast,hashlib
+        source = Path(bot.__file__).read_text()
+        expected = json.loads(Path(bot.__file__).with_name("prompt_checksums.json").read_text())
+        sections = {}
+        for node in ast.parse(source).body:
+            if isinstance(node,ast.FunctionDef) and node.name in {"ai_reply","load_system_prompt"}:
+                sections[node.name] = ast.get_source_segment(source,node)
+            if isinstance(node,ast.FunctionDef) and node.name == "extract_profile_update":
+                assignment = next(item for item in node.body if isinstance(item,ast.Assign) and any(isinstance(target,ast.Name) and target.id == "instructions" for target in item.targets))
+                sections["extraction_instructions"] = ast.get_source_segment(source,assignment.value)
+            if isinstance(node,ast.Assign) and any(isinstance(target,ast.Name) and target.id in {"ROLEPLAY_CHARACTER","CLOSING_MESSAGE"} for target in node.targets):
+                sections[node.targets[0].id] = ast.get_source_segment(source,node.value)
+        self.assertEqual({name:hashlib.sha256(text.encode()).hexdigest() for name,text in sections.items()},expected)
 
 
 if __name__ == "__main__":

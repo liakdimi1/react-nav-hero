@@ -69,9 +69,11 @@ it does not prove that Telegram or either model is reachable.
   including custom prompt files and `.env` overrides. Known wrong identities
   such as Nidum AI are removed from prior assistant context. Outgoing replies
   containing a known identity leak receive one corrective model request; if the
-  model still gets it wrong, a fixed, honest Ginger introduction is used.
+  model still gets it wrong, a configured Ginger fallback is used.
   Profile extraction remains a separate JSON-only task.
-- `/start` resumes a persisted stopped chat. `/stop` clears both in-memory and
+- Only the configured admin may use commands, and only in a private bot chat.
+  Client commands are silently ignored. Private admin controls work even when
+  direct test mode is disabled. `/start` is silent and resumes a persisted stopped chat. `/stop` clears both in-memory and
   stored recent context and cancels queued work. Human-review pauses still need
   `/resume_profile <connection_id:chat_id>` from the configured admin.
 - `/forget` clears the live profile, identity, transcript and pending job payloads
@@ -100,7 +102,7 @@ it does not prove that Telegram or either model is reachable.
   updates do not refresh them. Undated legacy plans are not assumed current.
 - Privacy details are sent only when someone requests `/privacy`; normal replies
   and `/start` do not include an automatic notice. Ready replies saved by older
-  versions have the exact legacy notice prefix removed before delivery.
+  versions should be checked before upgrading if they still contain notices.
   Recent transcripts are excluded from human handoffs by default. Common tokens,
   emails, passwords and long contact/account numbers are redacted best-effort.
   This is not a comprehensive sensitive-data detector or consent/age verifier.
@@ -132,7 +134,7 @@ providers. xAI requests retain the existing `store: false` setting.
 python -m unittest discover -s . -v
 ```
 
-62 regression tests cover identity retries/fallback, routing, stop/start/forget,
+70 regression tests cover identity retries/fallback, routing, stop/start/forget,
 admin access, migration, restart recovery, delivery failures/rate limits,
 privacy/retention, webhook overload, a concurrent forget/send race, and a complete
 worker flow against local mock HTTP APIs. They do not prove compatibility with
@@ -171,3 +173,18 @@ Ollama is installed separately. Keep the application directory on a persistent
 volume when deploying. None of the offline tests substitute for live model
 quality evaluation: try introductions, corrections, refusals, British phrasing
 and provider switches against your installed models before activating Telegram.
+
+## Correction of the uploaded Python file
+
+The Python prompt sections are preserved exactly from the supplied pasted file;
+`prompt_checksums.json` records their source hashes and a regression test checks
+those hashes. Existing external `.env`, `system_prompt.txt` and `Modelfile`
+contents were not edited in this correction. Keep your own versions when upgrading.
+
+The missing generated-answer persistence block is restored, including the
+cancellation check, turn reservation and durable ready status. Private admin
+controls are accepted with direct test mode disabled; `/start` remains silent.
+Free-form employment notes requested by the supplied extraction prompt are
+accepted and still require evidence from the current user message. Prompt text
+and extraction sampling settings are unchanged. Validation uses mocked APIs;
+live model/Telegram integration has not been tested with your credentials.

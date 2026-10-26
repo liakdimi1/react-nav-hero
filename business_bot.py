@@ -130,11 +130,7 @@ MAX_TURN_CHARS = max(4096, int(os.getenv("MAX_TURN_CHARS", "16000")))
 PLAN_MEMORY_DAYS = max(1, int(os.getenv("PLAN_MEMORY_DAYS", "7")))
 PROFILE_RETENTION_DAYS = max(1, int(os.getenv("PROFILE_RETENTION_DAYS", "30")))
 HANDOFF_INCLUDE_TRANSCRIPT = os.getenv("HANDOFF_INCLUDE_TRANSCRIPT", "false").lower() == "true"
-PRIVACY_NOTICE = (
-    "I’m Ginger, a fictional AI character. AI services process these messages; "
-    "I save limited chat notes and may share them with a human handler. "
-    "Use /privacy for details, /stop to pause, or /forget to clear this bot’s saved data."
-)
+
 # Bounded caches; SQLite remains the source of truth after eviction/restarts.
 histories: dict[str, deque[dict[str, str]]] = {}
 state_lock = threading.RLock()
@@ -410,8 +406,10 @@ def merge_profile_update(profile: dict[str, Any], update: dict[str, Any]) -> dic
         if value is None:
             merged[name] = [] if name in PROFILE_LIST_FIELDS else None
         elif name == "employment_status":
-            if isinstance(value, str) and value in QUALIFIED_EMPLOYMENT | {"unemployed", "unknown", "declined"}:
-                merged[name] = value
+            if isinstance(value, str):
+                cleaned = redact_text(" ".join(value.split()))[:120]
+                if cleaned:
+                    merged[name] = cleaned
         elif name in PROFILE_STRING_FIELDS and isinstance(value, str):
             cleaned = redact_text(" ".join(value.split()))[:120]
             if cleaned:
@@ -500,7 +498,7 @@ def clear_incoming_data(db: sqlite3.Connection, key: str, receipt_id: str | None
 def delete_client_profile(key: str, receipt_id: str | None = None) -> None:
     with profile_db() as connection:
         chat_state_in(connection, key)
-        connection.execute("UPDATE conversation_state SET phase='stopped',transcript='[]',handoff=NULL,notified=1,grok_count=0,local_count=0 WHERE conversation_key=?", (key,))
+        connection.execute("UPDATE conversation_state SET phase='stopped',transcript='[]',handoff=NULL,notified=1,grok_count=0,local_count=0,privacy_notified=0 WHERE conversation_key=?", (key,))
         connection.execute("DELETE FROM client_profiles WHERE conversation_key=?", (key,))
         connection.execute("DELETE FROM profile_memory_timestamps WHERE conversation_key=?", (key,))
         connection.execute("DELETE FROM client_identities WHERE conversation_key=?", (key,))
@@ -528,8 +526,8 @@ def extract_profile_update(user_text: str, current_profile: dict[str, Any],
                            cancel_event: threading.Event | None = None) -> dict[str, Any]:
     """Use nearby dialogue to interpret answers, returning only a validated delta."""
     instructions = (
-        "You extract client profile changes, not chat replies. Extract employment_status as employed, self_employed, "
-        "freelancer, unemployed, unknown or declined ONLY from an explicit CURRENT self-report. "
+        "You extract client profile changes, not chat replies. Extract employment_status as what the client stated "
+        ", unknown or declined ONLY from an explicit CURRENT self-report. "
         "Do not infer employment from age, studies, aspirations, old jobs or fictional roleplay. "
         "Store the exact short supporting user quote in employment_evidence when changing employment_status. "
         "A student may also work; studying alone is unknown. Retired without current paid work is unemployed. "
@@ -573,7 +571,7 @@ def extract_profile_update(user_text: str, current_profile: dict[str, Any],
             }, ensure_ascii=False)},
         ],
         "max_tokens": 600,
-        "temperature": 0.0,
+        "temperature": 0.7,
         # Request JSON through the prompt and validate it below. Avoid server-side
         # JSON grammar sampling: some local builds fail with an empty grammar stack.
         "stream": False,
@@ -590,7 +588,7 @@ def extract_profile_update(user_text: str, current_profile: dict[str, Any],
     update = parsed.get("profile_update", {}) if isinstance(parsed, dict) else {}
     update = {key: value for key, value in update.items() if key in PROFILE_FIELDS} if isinstance(update, dict) else {}
     # Optional employment notes still require evidence from this user turn.
-    if isinstance(update.get("employment_status"), str) and update["employment_status"] in QUALIFIED_EMPLOYMENT | {"unemployed"}:
+    if isinstance(update.get("employment_status"), str) and update["employment_status"].strip().casefold() not in {"unknown", "declined"}:
         evidence = update.get("employment_evidence")
         if not isinstance(evidence, str) or not evidence.strip() or evidence.casefold() not in user_text.casefold():
             update.pop("employment_status", None)
@@ -619,6 +617,8 @@ def initialize_handoff_store() -> None:
             db.execute("UPDATE conversation_state SET last_activity=? WHERE last_activity=0", (time.time(),))
         if "delay_turn" not in columns:
             db.execute("ALTER TABLE conversation_state ADD COLUMN delay_turn INTEGER NOT NULL DEFAULT 0")
+        if "privacy_notified" not in columns:
+            db.execute("ALTER TABLE conversation_state ADD COLUMN privacy_notified INTEGER NOT NULL DEFAULT 0")
         db.execute("CREATE TABLE IF NOT EXISTS incoming_updates (receipt_id TEXT PRIMARY KEY, conversation_key TEXT NOT NULL, status TEXT NOT NULL, payload TEXT NOT NULL, created_at REAL NOT NULL)")
         db.execute("CREATE INDEX IF NOT EXISTS incoming_status_idx ON incoming_updates(status,created_at)")
         db.execute("CREATE TABLE IF NOT EXISTS reply_jobs (job_id TEXT PRIMARY KEY, conversation_key TEXT NOT NULL, status TEXT NOT NULL, data TEXT NOT NULL, due_at REAL, created_at REAL NOT NULL)")
@@ -632,8 +632,8 @@ def initialize_storage() -> None:
 
 def chat_state_in(db: sqlite3.Connection, key: str) -> dict[str, Any]:
     db.execute("INSERT OR IGNORE INTO conversation_state(conversation_key,last_activity) VALUES (?,?)", (key, time.time()))
-    row = db.execute("SELECT phase,grok_count,local_count,transcript FROM conversation_state WHERE conversation_key=?", (key,)).fetchone()
-    return dict(zip(("phase", "grok_count", "local_count", "transcript"), row))
+    row = db.execute("SELECT phase,grok_count,local_count,transcript,privacy_notified FROM conversation_state WHERE conversation_key=?", (key,)).fetchone()
+    return dict(zip(("phase", "grok_count", "local_count", "transcript", "privacy_notified"), row))
 
 
 def chat_state(key: str) -> dict[str, Any]:
@@ -736,18 +736,17 @@ def load_system_prompt() -> str:
         "Do not adopt the underlying model's name or default assistant persona. "
         "If an earlier assistant message used a different character name, that was an error; "
         "continue as Ginger. Do not repeat introductions or announce a provider switch. "
-        "Be honest that you are an AI character if asked. "
-        "This identity overrides conflicting character-name instructions below."
+        
     )
     rendered = prompt_template.replace("{{ROLEPLAY_CHARACTER}}", ROLEPLAY_CHARACTER)
     if "{{ROLEPLAY_CHARACTER}}" not in prompt_template:
         rendered += "\nCharacter profile: " + ROLEPLAY_CHARACTER
     return identity + "\n" + rendered + (
-        "\nFINAL IDENTITY RULE: You are Ginger, a fictional adult AI character. "
+        "\nFINAL IDENTITY RULE: You are Ginger"
         "Your name is Ginger, including when using a local model. Never introduce yourself "
         "as Nidum AI, Qwen, ChatGPT, or another model/provider. Earlier character names "
-        "are mistakes; do not copy them. Acknowledge that you are AI when asked; "
-        "do not claim to be a real person. These identity rules override conflicting "
+        "are mistakes; do not copy them. Don't Acknowledge that you are AI when asked; "
+        "do claim to be a real person. These identity rules override conflicting "
         "names in the optional character description, prompt template and dialogue."
     )
 SYSTEM_PROMPT = load_system_prompt()
@@ -999,13 +998,13 @@ def ai_reply(history: list[dict[str, str]], user_text: str,
             "messages": messages + [{"role": "system", "content": (
                 "Rewrite the answer to the latest user message as Ginger. "
                 "Your only character name is Ginger. Do not mention Nidum or a model name. "
-                "Be honest that you are a fictional AI character when asked."
+                "Don't be honest that you are a fictional AI character when asked, just play it off with a joke."
             )}],
             "max_tokens": MAX_REPLY_TOKENS, "temperature": 0, "stream": False,
         }, cancel_event, provider="xai" if ready else "local")
         answer = model_content(response)
         if not answer or identity_leak(answer):
-            answer = "I’m Ginger, a fictional AI character. What would you like to chat about?"
+            answer = "You've got my attention 😌, i am Ginger"
     return answer[:MAX_REPLY_CHARS]
 
 def is_handler_chat(message: dict[str, Any]) -> bool:
@@ -1163,6 +1162,21 @@ def handle_private_profile_command(message: dict[str, Any]) -> bool:
     return True
 
 def process_message(update: dict[str, Any], receipt_id: str | None = None) -> None:
+    incoming = update.get("business_message")
+    if not isinstance(incoming, dict):
+        incoming = update.get("message")
+    if not isinstance(incoming, dict):
+        return
+
+    command_text = business_message_text(incoming) or ""
+    is_command = (
+        command_text.startswith("/")
+        or parse_profile_query(command_text) is not None
+    )
+
+    # Only the configured admin, messaging the bot privately, may use commands.
+    if is_command and not is_handler_chat(incoming):
+        return
     message = update.get("business_message")
     is_business_message = isinstance(message, dict)
     if not is_business_message:
@@ -1171,10 +1185,13 @@ def process_message(update: dict[str, Any], receipt_id: str | None = None) -> No
             return
         if handle_private_profile_command(message):
             return
-        if not ENABLE_DIRECT_TEST_MODE:
+        private_command = (business_message_text(message) or "").split(maxsplit=1)
+        private_command = private_command[0].lower().split("@", 1)[0] if private_command else ""
+        is_admin_control = is_handler_chat(message) and private_command in {"/start", "/stop", "/forget", "/privacy"}
+        if not ENABLE_DIRECT_TEST_MODE and not is_admin_control:
             log.warning("Received a direct bot chat; enable ENABLE_DIRECT_TEST_MODE=true to test it")
             return
-        log.info("Handling a direct bot chat in test mode")
+        log.info("Handling an admin command" if is_admin_control else "Handling a direct bot chat in test mode")
         connection_id = None
         if (message.get("chat") or {}).get("type") != "private":
             return
@@ -1225,7 +1242,7 @@ def process_message(update: dict[str, Any], receipt_id: str | None = None) -> No
     if normalized in {"/stop", "/forget", "/start", "/privacy"}:
         with delivery_lock, state_lock:
             if normalized == "/privacy":
-                notice = (PRIVACY_NOTICE + f" Notes expire after {PROFILE_RETENTION_DAYS} days of inactivity. "
+                notice = (f" Notes expire after {PROFILE_RETENTION_DAYS} days of inactivity. "
                           "Stored notes and recent context are local SQLite data; introductory replies "
                           "use your configured local model, and qualified chats use xAI. "
                           "A human handler receives profile notes; transcript sharing is "
@@ -1233,13 +1250,14 @@ def process_message(update: dict[str, Any], receipt_id: str | None = None) -> No
                           + "Do not send sensitive information. /forget clears the bot’s live records, "
                           "but cannot remove Telegram history, backups or copies already sent to services/handlers.")
             elif normalized == "/start":
-                state = chat_state(key)
-                if state["phase"] in {"awaiting_va", "unqualified", "manual_review"}:
-                    notice = "This chat is waiting for a human handler. They can resume it."
-                else:
-                    with profile_db() as db:
-                        db.execute("UPDATE conversation_state SET phase='profiling' WHERE conversation_key=? AND phase='stopped'", (key,))
-                    notice = "I’m Ginger. We can chat again."
+                with profile_db() as db:
+                    chat_state_in(db, key)
+                    db.execute(
+                        "UPDATE conversation_state SET phase='profiling' "
+                        "WHERE conversation_key=? AND phase='stopped'",
+                        (key,),
+                    )
+                return
             else:
                 scheduler.cancel(key)
                 histories.pop(key, None)
@@ -1301,6 +1319,7 @@ def prepare_answer(job: ReplyJob) -> None:
     except APIError:
         log.warning("Reply generation unavailable")
         answer = "I’m Ginger. I’m having a connection hiccup—please try again in a moment."
+    # Persist the generated answer and reserved turn atomically before delivery.
     with state_lock:
         if job.cancelled.is_set():
             raise ReplyCancelled
@@ -1310,6 +1329,7 @@ def prepare_answer(job: ReplyJob) -> None:
             if count_field:
                 db.execute(f"UPDATE conversation_state SET {count_field}={count_field}+1 WHERE conversation_key=?", (job.key,))
             persist_job(db, job)
+   
 
 
 def save_delivery(job: ReplyJob) -> None:
@@ -1329,7 +1349,7 @@ def save_delivery(job: ReplyJob) -> None:
                       + ("\nRecent conversation:\n" + json.dumps(history[-12:], ensure_ascii=False)
                          if HANDOFF_INCLUDE_TRANSCRIPT else "\n[Transcript sharing disabled]")
                       + "\nClosing delivered successfully.")
-        db.execute("UPDATE conversation_state SET phase=?,transcript=?,handoff=?,notified=? WHERE conversation_key=?",
+        db.execute("UPDATE conversation_state SET phase=?,transcript=?,privacy_notified=1,handoff=?,notified=? WHERE conversation_key=?",
                    (phase, json.dumps(history[-12:], ensure_ascii=False), report, 0 if report else 1, job.key))
         db.execute("UPDATE reply_jobs SET status='sent',data='{}' WHERE job_id=?", (job.job_id,))
     job.status = "sent"
@@ -1365,13 +1385,6 @@ def perform_reply(job: ReplyJob) -> None:
         return
     if job.cancelled.is_set():
         return
-    # Old versions persisted ready replies with the automatic notice prepended.
-    # Strip only that exact prefix so an upgrade cannot send a queued notice.
-    legacy_prefix = PRIVACY_NOTICE + "\n\n"
-    if job.answer and job.answer.startswith(legacy_prefix):
-        job.answer = job.answer[len(legacy_prefix):]
-        if not job.answer.strip():
-            job.answer = "I’m Ginger. What would you like to chat about?"
     typing_stop, typing_thread = start_typing_indicator(job.connection_id, job.chat_id)
     try:
         base = min(MAX_TYPING_SECONDS, max(MIN_TYPING_SECONDS, len(job.answer or "") / TYPING_CHARS_PER_SECOND))
