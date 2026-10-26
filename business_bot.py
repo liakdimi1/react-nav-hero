@@ -500,7 +500,7 @@ def clear_incoming_data(db: sqlite3.Connection, key: str, receipt_id: str | None
 def delete_client_profile(key: str, receipt_id: str | None = None) -> None:
     with profile_db() as connection:
         chat_state_in(connection, key)
-        connection.execute("UPDATE conversation_state SET phase='stopped',transcript='[]',handoff=NULL,notified=1,grok_count=0,local_count=0,privacy_notified=0 WHERE conversation_key=?", (key,))
+        connection.execute("UPDATE conversation_state SET phase='stopped',transcript='[]',handoff=NULL,notified=1,grok_count=0,local_count=0 WHERE conversation_key=?", (key,))
         connection.execute("DELETE FROM client_profiles WHERE conversation_key=?", (key,))
         connection.execute("DELETE FROM profile_memory_timestamps WHERE conversation_key=?", (key,))
         connection.execute("DELETE FROM client_identities WHERE conversation_key=?", (key,))
@@ -619,8 +619,6 @@ def initialize_handoff_store() -> None:
             db.execute("UPDATE conversation_state SET last_activity=? WHERE last_activity=0", (time.time(),))
         if "delay_turn" not in columns:
             db.execute("ALTER TABLE conversation_state ADD COLUMN delay_turn INTEGER NOT NULL DEFAULT 0")
-        if "privacy_notified" not in columns:
-            db.execute("ALTER TABLE conversation_state ADD COLUMN privacy_notified INTEGER NOT NULL DEFAULT 0")
         db.execute("CREATE TABLE IF NOT EXISTS incoming_updates (receipt_id TEXT PRIMARY KEY, conversation_key TEXT NOT NULL, status TEXT NOT NULL, payload TEXT NOT NULL, created_at REAL NOT NULL)")
         db.execute("CREATE INDEX IF NOT EXISTS incoming_status_idx ON incoming_updates(status,created_at)")
         db.execute("CREATE TABLE IF NOT EXISTS reply_jobs (job_id TEXT PRIMARY KEY, conversation_key TEXT NOT NULL, status TEXT NOT NULL, data TEXT NOT NULL, due_at REAL, created_at REAL NOT NULL)")
@@ -634,8 +632,8 @@ def initialize_storage() -> None:
 
 def chat_state_in(db: sqlite3.Connection, key: str) -> dict[str, Any]:
     db.execute("INSERT OR IGNORE INTO conversation_state(conversation_key,last_activity) VALUES (?,?)", (key, time.time()))
-    row = db.execute("SELECT phase,grok_count,local_count,transcript,privacy_notified FROM conversation_state WHERE conversation_key=?", (key,)).fetchone()
-    return dict(zip(("phase", "grok_count", "local_count", "transcript", "privacy_notified"), row))
+    row = db.execute("SELECT phase,grok_count,local_count,transcript FROM conversation_state WHERE conversation_key=?", (key,)).fetchone()
+    return dict(zip(("phase", "grok_count", "local_count", "transcript"), row))
 
 
 def chat_state(key: str) -> dict[str, Any]:
@@ -1241,7 +1239,7 @@ def process_message(update: dict[str, Any], receipt_id: str | None = None) -> No
                 else:
                     with profile_db() as db:
                         db.execute("UPDATE conversation_state SET phase='profiling' WHERE conversation_key=? AND phase='stopped'", (key,))
-                    notice = "I’m Ginger. We can chat again. " + PRIVACY_NOTICE
+                    notice = "I’m Ginger. We can chat again."
             else:
                 scheduler.cancel(key)
                 histories.pop(key, None)
@@ -1303,8 +1301,6 @@ def prepare_answer(job: ReplyJob) -> None:
     except APIError:
         log.warning("Reply generation unavailable")
         answer = "I’m Ginger. I’m having a connection hiccup—please try again in a moment."
-    if not state["privacy_notified"]:
-        answer = PRIVACY_NOTICE + "\n\n" + answer[-(MAX_REPLY_CHARS-len(PRIVACY_NOTICE)-2):]
     with state_lock:
         if job.cancelled.is_set():
             raise ReplyCancelled
@@ -1333,7 +1329,7 @@ def save_delivery(job: ReplyJob) -> None:
                       + ("\nRecent conversation:\n" + json.dumps(history[-12:], ensure_ascii=False)
                          if HANDOFF_INCLUDE_TRANSCRIPT else "\n[Transcript sharing disabled]")
                       + "\nClosing delivered successfully.")
-        db.execute("UPDATE conversation_state SET phase=?,transcript=?,privacy_notified=1,handoff=?,notified=? WHERE conversation_key=?",
+        db.execute("UPDATE conversation_state SET phase=?,transcript=?,handoff=?,notified=? WHERE conversation_key=?",
                    (phase, json.dumps(history[-12:], ensure_ascii=False), report, 0 if report else 1, job.key))
         db.execute("UPDATE reply_jobs SET status='sent',data='{}' WHERE job_id=?", (job.job_id,))
     job.status = "sent"
@@ -1369,6 +1365,13 @@ def perform_reply(job: ReplyJob) -> None:
         return
     if job.cancelled.is_set():
         return
+    # Old versions persisted ready replies with the automatic notice prepended.
+    # Strip only that exact prefix so an upgrade cannot send a queued notice.
+    legacy_prefix = PRIVACY_NOTICE + "\n\n"
+    if job.answer and job.answer.startswith(legacy_prefix):
+        job.answer = job.answer[len(legacy_prefix):]
+        if not job.answer.strip():
+            job.answer = "I’m Ginger. What would you like to chat about?"
     typing_stop, typing_thread = start_typing_indicator(job.connection_id, job.chat_id)
     try:
         base = min(MAX_TYPING_SECONDS, max(MIN_TYPING_SECONDS, len(job.answer or "") / TYPING_CHARS_PER_SECOND))

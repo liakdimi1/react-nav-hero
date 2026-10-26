@@ -98,7 +98,9 @@ it does not prove that Telegram or either model is reachable.
   Upcoming plans/events have individual confirmation timestamps and expire from
   usable profile memory after seven days unless explicitly reconfirmed. Unrelated
   updates do not refresh them. Undated legacy plans are not assumed current.
-- A first-reply privacy notice and `/privacy` explain storage and handoffs.
+- Privacy details are sent only when someone requests `/privacy`; normal replies
+  and `/start` do not include an automatic notice. Ready replies saved by older
+  versions have the exact legacy notice prefix removed before delivery.
   Recent transcripts are excluded from human handoffs by default. Common tokens,
   emails, passwords and long contact/account numbers are redacted best-effort.
   This is not a comprehensive sensitive-data detector or consent/age verifier.
@@ -130,7 +132,7 @@ providers. xAI requests retain the existing `store: false` setting.
 python -m unittest discover -s . -v
 ```
 
-59 regression tests cover identity retries/fallback, routing, stop/start/forget,
+62 regression tests cover identity retries/fallback, routing, stop/start/forget,
 admin access, migration, restart recovery, delivery failures/rate limits,
 privacy/retention, webhook overload, a concurrent forget/send race, and a complete
 worker flow against local mock HTTP APIs. They do not prove compatibility with

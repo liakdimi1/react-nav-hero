@@ -324,12 +324,12 @@ class BotTests(unittest.TestCase):
         self.assertEqual((a.delay, b.delay), (1, 2))
         self.assertIsNone(b.due_at)
 
-    def test_privacy_notice_and_redaction(self):
+    def test_first_reply_has_no_automatic_notice_and_keeps_redaction(self):
         job = self.schedule("my email is person@example.com and password=secret123")
         self.assertNotIn("person@example.com", self.rows("SELECT data FROM reply_jobs")[0][0])
         bot.perform_reply(job)
-        self.assertTrue(self.send.call_args.args[2].startswith(bot.PRIVACY_NOTICE))
-        self.assertEqual(bot.chat_state(job.key)["privacy_notified"], 1)
+        self.assertEqual(self.send.call_args.args[2], "I’m Ginger. Nice to meet you!")
+        self.assertNotIn(bot.PRIVACY_NOTICE, bot.chat_state(job.key)["transcript"])
 
     def test_retention_removes_stale_profiles_and_work(self):
         job = self.schedule(); bot.save_client_profile(job.key, qualified())
@@ -655,6 +655,35 @@ print('HTTP worker integration passed')
         environment.update(REPLY_DELAY_MIN_SECONDS="60",REPLY_DELAY_MAX_SECONDS="180")
         override = subprocess.run([sys.executable,"-c",script],cwd=Path(bot.__file__).parent,env=environment,capture_output=True,text=True,check=True)
         self.assertEqual(json.loads(override.stdout)[:2],[60.0,180.0])
+
+
+
+    def test_start_has_no_automatic_privacy_notice(self):
+        bot.process_message(message("/start"))
+        self.send.assert_called_once_with(None, 42, "I’m Ginger. We can chat again.")
+
+    def test_privacy_details_are_available_only_on_request(self):
+        bot.process_message(message("/privacy"))
+        self.assertIn(bot.PRIVACY_NOTICE, self.send.call_args.args[2])
+        self.assertIn("copies already sent", self.send.call_args.args[2])
+
+    def test_ready_legacy_reply_recovery_removes_automatic_notice(self):
+        job = self.schedule()
+        bot.prepare_answer(job)
+        job.answer = bot.PRIVACY_NOTICE + "\n\n" + "Hello again!"
+        with bot.profile_db() as db:
+            bot.persist_job(db, job)
+            # An existing deployment may still have this unused legacy column.
+            db.execute("ALTER TABLE conversation_state ADD COLUMN privacy_notified INTEGER NOT NULL DEFAULT 0")
+        bot.initialize_storage()
+        bot.scheduler = bot.ReplyScheduler()
+        bot.scheduler.restore()
+        recovered = bot.scheduler.pending[job.key][0]
+        self.model.reset_mock()
+        bot.perform_reply(recovered)
+        self.model.assert_not_called()
+        self.send.assert_called_once_with(None, 42, "Hello again!")
+        self.assertNotIn(bot.PRIVACY_NOTICE, bot.chat_state(job.key)["transcript"])
 
 
 if __name__ == "__main__":
