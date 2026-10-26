@@ -888,5 +888,36 @@ print('HTTP worker integration passed')
         self.assertFalse(payload["store"])
 
 
+    def test_harmless_model_mentions_do_not_trigger_identity_retry(self):
+        for text in ("I'm Ginger. You can run Qwen locally.", "Nidum AI is a model name, but call me Ginger.", "Have you tried Llama?", "I'm not Qwen, I'm Ginger.", "I don't have a name for that song."):
+            with self.subTest(text=text):
+                self.assertFalse(bot.identity_leak(text))
+                self.model.reset_mock()
+                self.model.return_value=response(text)
+                self.assertEqual(bot.ai_reply([],"Hi",bot.empty_profile()),text)
+                self.assertEqual(self.model.call_count,1)
+
+    def test_explicit_model_introductions_still_trigger_identity_check(self):
+        for text in ("I'm Nidum AI.", "I’m NidumAI", "My name is Qwen2.5", "Call me Grok.", "I am an AI assistant.", "I'm Dolphin-Mistral.", "Nidum AI", "I have no name."):
+            with self.subTest(text=text):
+                self.assertTrue(bot.identity_leak(text))
+
+    def test_drift_warning_identifies_provider_without_logging_chat(self):
+        self.model.side_effect=[response("I'm Nidum AI."),response("I'm Ginger.")]
+        with self.assertLogs(bot.log,level="WARNING") as logs:
+            bot.ai_reply([],"PRIVATE_USER_MESSAGE",bot.empty_profile())
+        output="\n".join(logs.output)
+        self.assertIn("provider=local",output)
+        self.assertIn("model="+bot.LOCAL_MODEL_NAME,output)
+        self.assertNotIn("PRIVATE_USER_MESSAGE",output)
+        self.assertNotIn("I'm Nidum AI",output)
+
+    def test_model_mentions_in_grok_history_are_preserved(self):
+        previous="I'm Ginger. We can talk about Qwen if you like."
+        bot.ai_reply([],"How does it work?",dict(bot.empty_profile(),age=25),grok_history=[{"role":"assistant","content":previous}])
+        payload=self.model.call_args.args[0]
+        self.assertIn(previous,[entry["content"] for entry in payload["messages"]])
+
+
 if __name__ == "__main__":
     unittest.main()

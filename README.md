@@ -134,7 +134,7 @@ providers. xAI requests retain the existing `store: false` setting.
 python -m unittest discover -s . -v
 ```
 
-80 regression tests cover identity retries/fallback, routing, stop/start/forget,
+84 regression tests cover identity retries/fallback, routing, stop/start/forget,
 admin access, migration, restart recovery, delivery failures/rate limits,
 privacy/retention, webhook overload, a concurrent forget/send race, and a complete
 worker flow against local mock HTTP APIs. They do not prove compatibility with
@@ -229,3 +229,13 @@ user-supplied facts or short employment evidence quotes; those are profile data.
 Tests verify the actual constructed xAI request, identity-retry requests,
 separate post-handoff memory, restart recovery and deletion of Grok context.
 No live xAI or Telegram calls were made during validation.
+
+## Identity warning
+
+The identity check retries known model self-introductions such as "I'm Nidum AI"
+once, then uses the configured Ginger fallback if needed. Ordinary discussion
+of model names no longer triggers that retry or removes assistant history.
+Warnings now identify the selected provider and model without logging chat text.
+A warning alone does not establish which underlying model behavior caused it;
+check whether the final delivered reply uses Ginger. All existing prompts remain
+unchanged by this identity-check correction.

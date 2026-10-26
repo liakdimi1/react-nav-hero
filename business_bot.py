@@ -953,17 +953,26 @@ def profile_ready(profile: dict[str, Any]) -> bool:
     return type(age) is int and 18 <= age <= 120 and profile.get("age_confirmed_adult") is not False
 
 
+# A model name mentioned as a topic is not a self-introduction. Match explicit
+# first-person identity claims instead of banning those words everywhere.
+MODEL_IDENTITY_NAME = (
+    r"(?:nidum(?:[\s_-]*ai)?|chatgpt|qwen[\w.:-]*|deepseek|llama[\w.:-]*|"
+    r"ollama|claude|grok|gemini|mistral|dolphin(?:[\s_-]*mistral)?|(?:ai\s+)?assistant)"
+)
 IDENTITY_LEAK = re.compile(
-    r"\b(?:nidum(?:[\s_-]*ai)?|chatgpt|qwen[\w.:-]*|deepseek|llama[\w.:-]*)\b"
-    r"|\b(?:my name is|call me|i(?:['’]m| am)(?: called| named)?)\s+(?:an?\s+)?"
-    r"(?:assistant|ollama|claude|grok|gemini|mistral)\b"
-    r"|\b(?:i (?:do not|don['’]t) have|i have no) (?:a )?(?:personal )?name\b",
+    r"\b(?:my name is|call me|i(?:['’]m| am)(?: called| named)?|i go by)\s+"
+    r"(?:an?\s+)?" + MODEL_IDENTITY_NAME + r"\b",
     re.IGNORECASE,
 )
+NAME_DENIAL = re.compile(
+    r"\b(?:i (?:do not|don['’]t) have|i have no) (?:a )?(?:personal )?name(?=\s*(?:[.!?,;:]|$))",
+    re.IGNORECASE,
+)
+BARE_MODEL_IDENTITY = re.compile(r"\s*" + MODEL_IDENTITY_NAME + r"[.!]?\s*", re.IGNORECASE)
 
 
 def identity_leak(text: str) -> bool:
-    return bool(IDENTITY_LEAK.search(text))
+    return bool(IDENTITY_LEAK.search(text) or NAME_DENIAL.search(text) or BARE_MODEL_IDENTITY.fullmatch(text))
 
 
 def ai_reply(history: list[dict[str, str]], user_text: str,
@@ -1026,7 +1035,8 @@ def ai_reply(history: list[dict[str, str]], user_text: str,
         raise APIError("The model returned no text.")
     if identity_leak(answer):
         # One corrective request only; never forward another model's persona.
-        log.warning("Model identity drift detected; requesting a Ginger reply")
+        log.warning("Model identity drift detected (provider=%s, model=%s); requesting a Ginger reply",
+                    "xai" if ready else "local", XAI_MODEL if ready else LOCAL_MODEL_NAME)
         response = model_request({
             "model": XAI_MODEL if ready else LOCAL_MODEL_NAME,
             "messages": messages + [{"role": "system", "content": (
