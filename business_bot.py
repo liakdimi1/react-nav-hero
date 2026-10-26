@@ -562,13 +562,18 @@ def extract_profile_update(user_text: str, current_profile: dict[str, Any],
         "Example: assistant asks 'What music do you like?', user answers 'techno' -> "
         "{\"profile_update\": {\"favorite_music\": \"techno\"}}."
     )
-    response = model_request({
+    payload = {
         "model": PROFILE_MODEL_NAME,
         "messages": [
             {"role": "system", "content": instructions},
             {"role": "user", "content": json.dumps({
                 "current_profile": current_profile,
-                "recent_dialogue_for_context": (recent_history or [])[-6:],
+                "recent_dialogue_for_context": [
+                    {"role": item["role"], "content": item["content"][-MAX_HISTORY_CHARS_PER_MESSAGE:]}
+                    for item in (recent_history or [])[-6:]
+                    if isinstance(item, dict) and item.get("role") in {"user", "assistant"}
+                    and isinstance(item.get("content"), str)
+                ],
                 "latest_user_answer": user_text,
             }, ensure_ascii=False)},
         ],
@@ -577,7 +582,21 @@ def extract_profile_update(user_text: str, current_profile: dict[str, Any],
         # Request JSON through the prompt and validate it below. Avoid server-side
         # JSON grammar sampling: some local builds fail with an empty grammar stack.
         "stream": False,
-    }, cancel_event, provider="local")
+    }
+    try:
+        response = model_request(payload, cancel_event, provider="local")
+    except APIError as exc:
+        if not exc.context_exceeded:
+            raise
+        # Retry once without old dialogue only when the server explicitly rejects
+        # the context size. Prompts, current profile and latest input stay intact.
+        request_data = json.loads(payload["messages"][1]["content"])
+        if not request_data["recent_dialogue_for_context"]:
+            raise
+        log.warning("Profile request exceeded the context window; retrying once without previous dialogue")
+        request_data["recent_dialogue_for_context"] = []
+        payload["messages"][1]["content"] = json.dumps(request_data, ensure_ascii=False)
+        response = model_request(payload, cancel_event, provider="local")
     content = model_content(response)
     if content.startswith("```"):
         content = "\n".join(content.splitlines()[1:])
@@ -774,10 +793,12 @@ GROK_SYSTEM_PROMPT = load_grok_system_prompt()
 
 
 class APIError(RuntimeError):
-    def __init__(self, message: str, *, uncertain: bool = False, retry_after: int | None = None):
+    def __init__(self, message: str, *, uncertain: bool = False, retry_after: int | None = None,
+                 context_exceeded: bool = False):
         super().__init__(redact_text(message))
         self.uncertain = uncertain
         self.retry_after = retry_after
+        self.context_exceeded = context_exceeded
 
 
 def post_json(url: str, payload: dict[str, Any], headers: dict[str, str] | None = None,
@@ -790,18 +811,56 @@ def post_json(url: str, payload: dict[str, Any], headers: dict[str, str] | None 
         with urllib.request.urlopen(request, timeout=timeout) as response:
             data = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        # Never log request URLs, credentials, or arbitrary upstream response bodies.
+        # Inspect known error categories, never log arbitrary response bodies:
+        # model servers can echo prompts, personal data, URLs or credentials.
+        try:
+            error_body = json.loads(exc.read(8192))
+        except (TypeError, ValueError, OSError):
+            error_body = {}
+        if not isinstance(error_body, dict):
+            error_body = {}
+        nested = error_body.get("error")
+        nested = nested if isinstance(nested, dict) else {}
+        message = nested.get("message", error_body.get("message", ""))
+        message = message.casefold() if isinstance(message, str) else ""
+        kind = nested.get("type", error_body.get("type", ""))
+        kind = kind.casefold() if isinstance(kind, str) else ""
+        context_exceeded = exc.code in {400, 413, 422} and (
+            kind in {"exceed_context_size_error", "context_length_exceeded"}
+            or any(marker in message for marker in (
+                "exceeds the available context size", "exceeds available context size",
+                "context length exceeded", "maximum context length", "exceed_context_size"))
+        )
+        detail = f"Upstream HTTP {exc.code}"
+        if context_exceeded:
+            detail += ": request exceeds the model server's context window"
+            for field in ("n_prompt_tokens", "n_ctx"):
+                value = nested.get(field, error_body.get(field))
+                if type(value) is int and 0 < value <= 100_000_000:
+                    detail += f"; {field}={value}"
+        elif "model" in message and any(marker in message for marker in ("not found", "does not exist", "unknown model")):
+            detail += ": requested model is unavailable; check the server alias and PROFILE_MODEL_NAME"
+        elif "loading model" in message or "model is loading" in message:
+            detail += ": model is still loading"
+        elif any(marker in message for marker in ("out of memory", "out of device memory")):
+            detail += ": model server ran out of memory"
         retry_after = None
         if exc.code == 429:
             try:
-                error = json.loads(exc.read(4096))
-                retry_after = max(1, min(300, int(error.get("parameters", {}).get("retry_after", 3))))
+                retry_after = max(1, min(300, int(error_body.get("parameters", {}).get("retry_after", 3))))
             except (TypeError, ValueError, AttributeError):
                 retry_after = 3
-        raise APIError(f"Upstream HTTP {exc.code}", uncertain=exc.code >= 500,
-                       retry_after=retry_after) from None
+        raise APIError(detail, uncertain=exc.code >= 500, retry_after=retry_after,
+                       context_exceeded=context_exceeded) from None
     except (urllib.error.URLError, TimeoutError, http.client.HTTPException, ValueError) as exc:
-        raise APIError(f"Upstream request failed ({type(exc).__name__})", uncertain=True) from None
+        reason = getattr(exc, "reason", exc)
+        if isinstance(reason, (TimeoutError,)):
+            detail = "Upstream request timed out; the local model may need a longer LOCAL_MODEL_TIMEOUT_SECONDS"
+        elif isinstance(reason, ConnectionRefusedError) or getattr(reason, "errno", None) in {61, 111, 10061}:
+            detail = "Connection refused; check that the local model server is running on the configured port"
+        else:
+            detail = f"Upstream request failed ({type(exc).__name__})"
+        raise APIError(detail, uncertain=True) from None
     if not isinstance(data, dict):
         raise APIError("API response was not a JSON object", uncertain=True)
     if data.get("ok") is False:
@@ -1339,8 +1398,9 @@ def prepare_answer(job: ReplyJob) -> None:
                 if update:
                     profile = merge_profile_update(load_client_profile(job.key), update)
                     save_client_profile(job.key, profile, confirmed_update=update)
-        except APIError:
-            log.warning("Profile extraction unavailable; retaining saved profile")
+        except APIError as exc:
+            log.warning("Profile extraction unavailable (model=%s, timeout=%ss): %s; retaining saved profile",
+                        PROFILE_MODEL_NAME, LOCAL_MODEL_TIMEOUT_SECONDS, exc)
     state = chat_state(job.key)
     count_field = None
     try:

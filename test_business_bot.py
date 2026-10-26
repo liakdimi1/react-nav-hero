@@ -919,5 +919,101 @@ print('HTTP worker integration passed')
         self.assertIn(previous,[entry["content"] for entry in payload["messages"]])
 
 
+    def test_llama_context_error_is_classified_without_echoing_body(self):
+        import urllib.error
+        body={"error":{"type":"exceed_context_size_error","message":"request exceeds the available context size PRIVATE_CHAT_TEXT", "n_ctx":2048,"n_prompt_tokens":2800}}
+        error=urllib.error.HTTPError("http://127.0.0.1:8080/v1/chat/completions",400,"Bad request",{},io.BytesIO(json.dumps(body).encode()))
+        with patch.object(bot.urllib.request,"urlopen",side_effect=error):
+            with self.assertRaises(bot.APIError) as caught:
+                bot.post_json(bot.LOCAL_CHAT_COMPLETIONS_API,{})
+        self.assertTrue(caught.exception.context_exceeded)
+        self.assertIn("n_ctx=2048",str(caught.exception))
+        self.assertIn("n_prompt_tokens=2800",str(caught.exception))
+        self.assertNotIn("PRIVATE_CHAT_TEXT",str(caught.exception))
+
+    def test_profile_context_retry_keeps_current_profile_input_and_prompt(self):
+        snapshots=[]
+        def model(payload,*args,**kwargs):
+            snapshots.append(json.loads(json.dumps(payload)))
+            if len(snapshots)==1:
+                raise bot.APIError("context exceeded",context_exceeded=True)
+            return response('{"profile_update":{"age":25}}')
+        self.model.side_effect=model
+        profile=dict(bot.empty_profile(),name="Alex")
+        update=bot.extract_profile_update("I am 25",profile,[{"role":"assistant","content":"How old are you?"}])
+        self.assertEqual(update["age"],25)
+        self.assertEqual(len(snapshots),2)
+        first=json.loads(snapshots[0]["messages"][1]["content"])
+        second=json.loads(snapshots[1]["messages"][1]["content"])
+        self.assertEqual(second["recent_dialogue_for_context"],[])
+        self.assertTrue(first["recent_dialogue_for_context"])
+        self.assertEqual(first["current_profile"],second["current_profile"])
+        self.assertEqual(first["latest_user_answer"],second["latest_user_answer"])
+        self.assertEqual(snapshots[0]["messages"][0],snapshots[1]["messages"][0])
+
+    def test_profile_retry_is_bounded_and_not_used_for_connection_failures(self):
+        self.model.side_effect=bot.APIError("context exceeded",context_exceeded=True)
+        with self.assertRaises(bot.APIError):
+            bot.extract_profile_update("Hi",bot.empty_profile(),[{"role":"user","content":"old"}])
+        self.assertEqual(self.model.call_count,2)
+        self.model.reset_mock();self.model.side_effect=bot.APIError("Connection refused")
+        with self.assertRaises(bot.APIError):
+            bot.extract_profile_update("Hi",bot.empty_profile(),[{"role":"user","content":"old"}])
+        self.assertEqual(self.model.call_count,1)
+
+    def test_context_overflow_without_old_dialogue_is_not_retried(self):
+        self.model.side_effect=bot.APIError("context exceeded",context_exceeded=True)
+        with self.assertRaises(bot.APIError):bot.extract_profile_update("Hi",bot.empty_profile())
+        self.assertEqual(self.model.call_count,1)
+
+    def test_profile_request_bounds_previous_messages_only(self):
+        self.model.return_value=response('{"profile_update":{}}')
+        history=[{"role":"assistant","content":"A"*5000} for _ in range(8)]
+        latest="B"*9000
+        profile=dict(bot.empty_profile(),interests=["music"])
+        bot.extract_profile_update(latest,profile,history)
+        data=json.loads(self.model.call_args.args[0]["messages"][1]["content"])
+        self.assertEqual(len(data["recent_dialogue_for_context"]),6)
+        self.assertTrue(all(len(message["content"])==bot.MAX_HISTORY_CHARS_PER_MESSAGE for message in data["recent_dialogue_for_context"]))
+        self.assertEqual(data["latest_user_answer"],latest)
+        self.assertEqual(data["current_profile"],profile)
+
+    def test_profile_failure_log_reports_cause_and_retains_profile(self):
+        job=self.schedule("PRIVATE_CLIENT_MESSAGE")
+        bot.save_client_profile(job.key,dict(bot.empty_profile(),name="Alex"))
+        with patch.object(bot,"PROFILE_EXTRACTION_ENABLED",True),patch.object(bot,"extract_profile_update",side_effect=bot.APIError("Upstream HTTP 404: requested model is unavailable")):
+            with self.assertLogs(bot.log,level="WARNING") as logs:bot.prepare_answer(job)
+        output="\n".join(logs.output)
+        self.assertIn("HTTP 404",output)
+        self.assertIn("model="+bot.PROFILE_MODEL_NAME,output)
+        self.assertNotIn("PRIVATE_CLIENT_MESSAGE",output)
+        self.assertEqual(bot.load_client_profile(job.key)["name"],"Alex")
+
+    def test_connection_refusal_and_timeout_have_actionable_safe_errors(self):
+        import urllib.error
+        for reason,expected in ((ConnectionRefusedError(111,"PRIVATE_URL"),"Connection refused"),(TimeoutError("PRIVATE_URL"),"timed out")):
+            with self.subTest(reason=reason):
+                with patch.object(bot.urllib.request,"urlopen",side_effect=urllib.error.URLError(reason)):
+                    with self.assertRaises(bot.APIError) as caught:bot.post_json(bot.LOCAL_CHAT_COMPLETIONS_API,{})
+                self.assertIn(expected,str(caught.exception))
+                self.assertNotIn("PRIVATE_URL",str(caught.exception))
+
+    def test_unknown_upstream_error_body_is_not_logged(self):
+        import urllib.error
+        error=urllib.error.HTTPError("https://example.com/SECRET",400,"Bad request",{},io.BytesIO(b'{"error":{"message":"PRIVATE_CHAT_TEXT and SECRET"}}'))
+        with patch.object(bot.urllib.request,"urlopen",side_effect=error):
+            with self.assertRaises(bot.APIError) as caught:bot.post_json(bot.LOCAL_CHAT_COMPLETIONS_API,{})
+        self.assertEqual(str(caught.exception),"Upstream HTTP 400")
+        self.assertFalse(caught.exception.context_exceeded)
+
+    def test_requested_model_unavailable_is_classified_without_echo(self):
+        import urllib.error
+        error=urllib.error.HTTPError("https://example.com",404,"Not found",{},io.BytesIO(b'{"error":{"message":"model PRIVATE_MODEL not found"}}'))
+        with patch.object(bot.urllib.request,"urlopen",side_effect=error):
+            with self.assertRaises(bot.APIError) as caught:bot.post_json(bot.LOCAL_CHAT_COMPLETIONS_API,{})
+        self.assertIn("requested model is unavailable",str(caught.exception))
+        self.assertNotIn("PRIVATE_MODEL",str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -134,7 +134,7 @@ providers. xAI requests retain the existing `store: false` setting.
 python -m unittest discover -s . -v
 ```
 
-84 regression tests cover identity retries/fallback, routing, stop/start/forget,
+93 regression tests cover identity retries/fallback, routing, stop/start/forget,
 admin access, migration, restart recovery, delivery failures/rate limits,
 privacy/retention, webhook overload, a concurrent forget/send race, and a complete
 worker flow against local mock HTTP APIs. They do not prove compatibility with
@@ -239,3 +239,37 @@ Warnings now identify the selected provider and model without logging chat text.
 A warning alone does not establish which underlying model behavior caused it;
 check whether the final delivered reply uses Ginger. All existing prompts remain
 unchanged by this identity-check correction.
+
+## Profile-extraction failures on local servers
+
+`Profile extraction unavailable` means the local request failed and the stored
+profile was retained. It does not by itself identify the cause. Warnings now
+include the requested profile model, timeout and a safe upstream error category;
+arbitrary response bodies and chat text are not logged. Recognized context
+errors include numeric `n_ctx`/`n_prompt_tokens` when supplied by the server.
+
+Run `python business_bot.py --test-profile-model` from the bot folder to isolate
+the extraction request without Telegram. For the single llama.cpp server with
+`--alias ginger --port 8080`, verify:
+
+```dotenv
+LOCAL_MODEL_BASE_URL=http://127.0.0.1:8080/v1
+LOCAL_MODEL_NAME=ginger
+PROFILE_MODEL_NAME=ginger
+```
+
+- Connection refused: start the server and check the configured port.
+- Model unavailable: match `PROFILE_MODEL_NAME` to the loaded server's alias.
+- Timeout: a partially CPU-offloaded 7B model may need more time. Set
+  `LOCAL_MODEL_TIMEOUT_SECONDS=600` if the log confirms timeouts, then restart
+  the bot. This increases waiting time, not generation speed.
+- Context overflow: extraction instructions, profile, history and generated
+  output share the model context. 2048 tokens may be insufficient. Previous
+  messages are now bounded; an explicit context overflow triggers one retry
+  without old dialogue. The current profile, latest input and instructions are
+  preserved. If that still exceeds the limit, increase the server context (for
+  example to 4096) and reduce GPU-offloaded layers if needed for available VRAM.
+
+A simple diagnostic can pass while long live conversations still exceed the
+context limit. Check the actual warning and server error before choosing a fix.
+Prompt text and extraction sampling settings are unchanged.
