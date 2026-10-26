@@ -134,7 +134,7 @@ providers. xAI requests retain the existing `store: false` setting.
 python -m unittest discover -s . -v
 ```
 
-70 regression tests cover identity retries/fallback, routing, stop/start/forget,
+80 regression tests cover identity retries/fallback, routing, stop/start/forget,
 admin access, migration, restart recovery, delivery failures/rate limits,
 privacy/retention, webhook overload, a concurrent forget/send race, and a complete
 worker flow against local mock HTTP APIs. They do not prove compatibility with
@@ -188,3 +188,44 @@ Free-form employment notes requested by the supplied extraction prompt are
 accepted and still require evidence from the current user message. Prompt text
 and extraction sampling settings are unchanged. Validation uses mocked APIs;
 live model/Telegram integration has not been tested with your credentials.
+
+## Llama profiling → profile-only Grok handoff
+
+For a llama.cpp server started with `--alias ginger --port 8080`, set:
+
+```dotenv
+LOCAL_MODEL_BASE_URL=http://127.0.0.1:8080/v1
+LOCAL_MODEL_NAME=ginger
+PROFILE_MODEL_NAME=ginger
+GROK_SYSTEM_PROMPT_FILE=grok_prompt.txt
+```
+
+The earlier Ollama instructions remain an alternative; a single llama.cpp server
+uses the same loaded Llama model for local replies and JSON extraction. Set an
+available `XAI_MODEL` and your `XAI_API_KEY` for Grok.
+
+The data flow is:
+
+1. Llama handles introductions and extracts the profile locally.
+2. When an exact adult age is established, Grok's first request contains the
+   validated profile plus shared character instructions and `grok_prompt.txt`.
+   It does not contain the profiling transcript, Llama's prior replies, or even
+   the final raw message that completed the profile.
+3. Subsequent Grok requests contain the profile, new client messages, and Grok's
+   own post-handoff chat history only. Grok needs those new messages to respond.
+
+Grok history is stored separately in SQLite (`grok_history`). Migration never
+copies the old combined transcript into it. `/stop`, `/forget` and admin resume
+clear this separate context as appropriate. Pending handoffs retain their context
+boundary on restart. Changes cannot retract any requests made by older versions.
+
+Edit `grok_prompt.txt` for additional instructions that only Grok receives.
+`GROK_SYSTEM_PROMPT` can override that file via `.env`, using `\n` for newlines.
+The existing shared character prompt and the Llama extraction prompt are kept
+unchanged. The separate file adds profile-handoff and conversation instructions
+without forwarding Llama chat content. Profile fields themselves may contain
+user-supplied facts or short employment evidence quotes; those are profile data.
+
+Tests verify the actual constructed xAI request, identity-retry requests,
+separate post-handoff memory, restart recovery and deletion of Grok context.
+No live xAI or Telegram calls were made during validation.

@@ -22,6 +22,7 @@ bot = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = bot
 with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "", "XAI_API_KEY": "", "SYSTEM_PROMPT_FILE": "/nonexistent-ginger-test-prompt"}):
     SPEC.loader.exec_module(bot)
+REAL_MODEL_REQUEST = bot.model_request
 
 
 def response(text):
@@ -760,14 +761,131 @@ print('HTTP worker integration passed')
         expected = json.loads(Path(bot.__file__).with_name("prompt_checksums.json").read_text())
         sections = {}
         for node in ast.parse(source).body:
-            if isinstance(node,ast.FunctionDef) and node.name in {"ai_reply","load_system_prompt"}:
+            if isinstance(node,ast.FunctionDef) and node.name == "load_system_prompt":
                 sections[node.name] = ast.get_source_segment(source,node)
+            if isinstance(node,ast.FunctionDef) and node.name == "ai_reply":
+                parts = []
+                for item in ast.walk(node):
+                    if isinstance(item,(ast.Assign,ast.AugAssign)):
+                        targets = item.targets if isinstance(item,ast.Assign) else [item.target]
+                        if any(isinstance(target,ast.Name) and target.id == "guidance" for target in targets):
+                            parts.append((item.lineno,ast.get_source_segment(source,item.value)))
+                    if isinstance(item,ast.Constant) and isinstance(item.value,str) and (item.value.startswith("Rewrite the answer") or item.value.startswith("You've got my attention")):
+                        parts.append((item.lineno,item.value))
+                sections["ai_reply_prompt_parts"] = json.dumps([value for _,value in sorted(parts)],ensure_ascii=False)
             if isinstance(node,ast.FunctionDef) and node.name == "extract_profile_update":
                 assignment = next(item for item in node.body if isinstance(item,ast.Assign) and any(isinstance(target,ast.Name) and target.id == "instructions" for target in item.targets))
                 sections["extraction_instructions"] = ast.get_source_segment(source,assignment.value)
             if isinstance(node,ast.Assign) and any(isinstance(target,ast.Name) and target.id in {"ROLEPLAY_CHARACTER","CLOSING_MESSAGE"} for target in node.targets):
                 sections[node.targets[0].id] = ast.get_source_segment(source,node.value)
         self.assertEqual({name:hashlib.sha256(text.encode()).hexdigest() for name,text in sections.items()},expected)
+
+
+    def test_grok_bootstrap_receives_only_profile_not_profiling_text(self):
+        profile = dict(bot.empty_profile(), age=25, name="Alex", interests=["music"])
+        local_history = [{"role":"user","content":"PRIVATE_PROFILING_SENTINEL"}, {"role":"assistant","content":"PRIVATE_LLAMA_REPLY"}]
+        bot.ai_reply(local_history,"FINAL_PROFILING_ANSWER",profile)
+        payload = self.model.call_args.args[0]
+        encoded = json.dumps(payload)
+        self.assertNotIn("PRIVATE_PROFILING_SENTINEL",encoded)
+        self.assertNotIn("PRIVATE_LLAMA_REPLY",encoded)
+        self.assertNotIn("FINAL_PROFILING_ANSWER",encoded)
+        self.assertEqual(self.model.call_args.kwargs["provider"],"xai")
+        self.assertEqual(json.loads(payload["messages"][-1]["content"]),{"client_profile":bot.merge_profile_update(bot.empty_profile(),profile)})
+        self.assertEqual(len(payload["messages"]),2)
+
+    def test_grok_subsequent_turn_receives_only_post_handoff_context(self):
+        profile = dict(bot.empty_profile(),age=25)
+        local = [{"role":"user","content":"OLD_PROFILING_SECRET"}]
+        grok = [{"role":"assistant","content":"GROK_REPLY_ONLY"}, {"role":"user","content":"POST_HANDOFF_USER"}]
+        bot.ai_reply(local,"NEW_CLIENT_MESSAGE",profile,grok_history=grok)
+        payload = self.model.call_args.args[0]
+        encoded = json.dumps(payload)
+        self.assertNotIn("OLD_PROFILING_SECRET",encoded)
+        for text in ("GROK_REPLY_ONLY","POST_HANDOFF_USER","NEW_CLIENT_MESSAGE"):
+            self.assertIn(text,encoded)
+
+    def test_identity_retry_cannot_leak_profiling_context(self):
+        self.model.side_effect=[response("I'm Nidum AI"),response("I'm Ginger")]
+        bot.ai_reply([{"role":"user","content":"PRIVATE_LOCAL_TURN"}],"FINAL_LOCAL_ANSWER",dict(bot.empty_profile(),age=25))
+        for call in self.model.call_args_list:
+            self.assertNotIn("PRIVATE_LOCAL_TURN",json.dumps(call.args[0]))
+            self.assertNotIn("FINAL_LOCAL_ANSWER",json.dumps(call.args[0]))
+
+    def test_grok_instructions_are_not_sent_to_llama_extraction_or_intro(self):
+        with patch.object(bot,"GROK_SYSTEM_PROMPT","GROK_ONLY_INSTRUCTIONS"):
+            bot.ai_reply([],"Hello",bot.empty_profile())
+            self.assertNotIn("GROK_ONLY_INSTRUCTIONS",json.dumps(self.model.call_args.args[0]))
+            self.model.return_value=response('{"profile_update":{}}')
+            bot.extract_profile_update("Hello",bot.empty_profile())
+            self.assertNotIn("GROK_ONLY_INSTRUCTIONS",json.dumps(self.model.call_args.args[0]))
+            self.model.return_value=response("I'm Ginger")
+            bot.ai_reply([],"I am 25",dict(bot.empty_profile(),age=25))
+            self.assertIn("GROK_ONLY_INSTRUCTIONS",self.model.call_args.args[0]["messages"][0]["content"])
+
+    def test_profile_handoff_is_saved_without_the_final_profiling_user_turn(self):
+        job=self.schedule("PRIVATE_LAST_PROFILING_TURN")
+        bot.save_client_profile(job.key,dict(bot.empty_profile(),age=25))
+        bot.perform_reply(job)
+        state=bot.chat_state(job.key)
+        self.assertIn("PRIVATE_LAST_PROFILING_TURN",state["transcript"])
+        self.assertNotIn("PRIVATE_LAST_PROFILING_TURN",state["grok_history"])
+        self.assertEqual(json.loads(state["grok_history"]),[{"role":"assistant","content":job.answer}])
+        self.assertTrue(job.profile_handoff)
+        self.assertEqual(job.provider,"xai")
+        second=bot.scheduler.add(job.key,None,42,"NEW_GROK_PHASE_MESSAGE")
+        bot.perform_reply(second)
+        self.assertIn("NEW_GROK_PHASE_MESSAGE",bot.chat_state(job.key)["grok_history"])
+        self.assertNotIn("PRIVATE_LAST_PROFILING_TURN",json.dumps(self.model.call_args.args[0]))
+
+    def test_grok_history_survives_restart_and_forget_erases_it(self):
+        job=self.schedule("LOCAL_ONLY_TEXT")
+        bot.save_client_profile(job.key,dict(bot.empty_profile(),age=25))
+        bot.perform_reply(job)
+        bot.histories.clear()
+        history=json.loads(bot.chat_state(job.key)["grok_history"])
+        self.assertEqual(history,[{"role":"assistant","content":job.answer}])
+        admin_control(message("/forget",2))
+        self.assertEqual(bot.chat_state(job.key)["grok_history"],"[]")
+
+    def test_admin_resume_does_not_reuse_old_grok_context(self):
+        key="biz:42"
+        bot.chat_state(key)
+        self.execute("UPDATE conversation_state SET phase='awaiting_va',grok_history=? WHERE conversation_key=?",(json.dumps([{"role":"assistant","content":"OLD_GROK_CONTEXT"}]),key))
+        bot.process_message(message("/resume_profile " + key,chat_id=99))
+        self.assertEqual(bot.chat_state(key)["grok_history"],"[]")
+
+    def test_ready_grok_handoff_recovery_preserves_context_boundary(self):
+        job=self.schedule("PRIVATE_PROFILING_COMPLETION")
+        bot.save_client_profile(job.key,dict(bot.empty_profile(),age=25))
+        bot.prepare_answer(job)
+        bot.scheduler=bot.ReplyScheduler();bot.scheduler.restore()
+        restored=bot.scheduler.pending[job.key][0]
+        self.assertEqual(restored.provider,"xai")
+        self.assertTrue(restored.profile_handoff)
+        self.model.reset_mock();bot.perform_reply(restored)
+        self.model.assert_not_called()
+        self.assertNotIn("PRIVATE_PROFILING_COMPLETION",bot.chat_state(job.key)["grok_history"])
+
+    def test_grok_file_and_environment_override(self):
+        path=Path(self.tmp.name)/"grok_prompt.txt";path.write_text("GROK_ONLY {{ROLEPLAY_CHARACTER}}")
+        with patch.dict(os.environ,{"GROK_SYSTEM_PROMPT":"","GROK_SYSTEM_PROMPT_FILE":str(path)}):
+            self.assertIn("GROK_ONLY Ginger",bot.load_grok_system_prompt())
+        with patch.dict(os.environ,{"GROK_SYSTEM_PROMPT":"OVERRIDE\\nSECOND","GROK_SYSTEM_PROMPT_FILE":str(path)}):
+            self.assertEqual(bot.load_grok_system_prompt(),"OVERRIDE\nSECOND")
+        with patch.dict(os.environ,{"GROK_SYSTEM_PROMPT":"","GROK_SYSTEM_PROMPT_FILE":str(path)+"missing"}):
+            with self.assertRaises(SystemExit):bot.load_grok_system_prompt()
+
+    def test_actual_xai_http_payload_excludes_profiling_chats(self):
+        reply={"object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"I'm Ginger"}]}]}
+        with patch.object(bot,"model_request",REAL_MODEL_REQUEST),patch.object(bot,"XAI_API_KEY","test-only-key"),patch.object(bot,"post_json",return_value=reply) as http:
+            bot.ai_reply([{"role":"user","content":"PRIVATE_PROFILING_HISTORY"}],"PRIVATE_COMPLETION_MESSAGE",dict(bot.empty_profile(),age=25))
+        url,payload=http.call_args.args
+        self.assertEqual(url,"https://api.x.ai/v1/responses")
+        self.assertNotIn("PRIVATE_PROFILING_HISTORY",json.dumps(payload))
+        self.assertNotIn("PRIVATE_COMPLETION_MESSAGE",json.dumps(payload))
+        self.assertIn("client_profile",payload["input"][-1]["content"])
+        self.assertFalse(payload["store"])
 
 
 if __name__ == "__main__":

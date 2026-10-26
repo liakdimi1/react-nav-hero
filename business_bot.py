@@ -171,6 +171,8 @@ class ReplyJob:
     answer: str | None = None
     closing_phase: str | None = None
     generated: bool = False
+    provider: str | None = None
+    profile_handoff: bool = False
     status: str = "pending"
     due_at: float | None = None
     sent_at: float | None = None
@@ -498,7 +500,7 @@ def clear_incoming_data(db: sqlite3.Connection, key: str, receipt_id: str | None
 def delete_client_profile(key: str, receipt_id: str | None = None) -> None:
     with profile_db() as connection:
         chat_state_in(connection, key)
-        connection.execute("UPDATE conversation_state SET phase='stopped',transcript='[]',handoff=NULL,notified=1,grok_count=0,local_count=0,privacy_notified=0 WHERE conversation_key=?", (key,))
+        connection.execute("UPDATE conversation_state SET phase='stopped',transcript='[]',grok_history='[]',handoff=NULL,notified=1,grok_count=0,local_count=0,privacy_notified=0 WHERE conversation_key=?", (key,))
         connection.execute("DELETE FROM client_profiles WHERE conversation_key=?", (key,))
         connection.execute("DELETE FROM profile_memory_timestamps WHERE conversation_key=?", (key,))
         connection.execute("DELETE FROM client_identities WHERE conversation_key=?", (key,))
@@ -617,6 +619,8 @@ def initialize_handoff_store() -> None:
             db.execute("UPDATE conversation_state SET last_activity=? WHERE last_activity=0", (time.time(),))
         if "delay_turn" not in columns:
             db.execute("ALTER TABLE conversation_state ADD COLUMN delay_turn INTEGER NOT NULL DEFAULT 0")
+        if "grok_history" not in columns:
+            db.execute("ALTER TABLE conversation_state ADD COLUMN grok_history TEXT NOT NULL DEFAULT '[]'")
         if "privacy_notified" not in columns:
             db.execute("ALTER TABLE conversation_state ADD COLUMN privacy_notified INTEGER NOT NULL DEFAULT 0")
         db.execute("CREATE TABLE IF NOT EXISTS incoming_updates (receipt_id TEXT PRIMARY KEY, conversation_key TEXT NOT NULL, status TEXT NOT NULL, payload TEXT NOT NULL, created_at REAL NOT NULL)")
@@ -632,8 +636,8 @@ def initialize_storage() -> None:
 
 def chat_state_in(db: sqlite3.Connection, key: str) -> dict[str, Any]:
     db.execute("INSERT OR IGNORE INTO conversation_state(conversation_key,last_activity) VALUES (?,?)", (key, time.time()))
-    row = db.execute("SELECT phase,grok_count,local_count,transcript,privacy_notified FROM conversation_state WHERE conversation_key=?", (key,)).fetchone()
-    return dict(zip(("phase", "grok_count", "local_count", "transcript", "privacy_notified"), row))
+    row = db.execute("SELECT phase,grok_count,local_count,transcript,privacy_notified,grok_history FROM conversation_state WHERE conversation_key=?", (key,)).fetchone()
+    return dict(zip(("phase", "grok_count", "local_count", "transcript", "privacy_notified", "grok_history"), row))
 
 
 def chat_state(key: str) -> dict[str, Any]:
@@ -656,7 +660,7 @@ def read_transcript(raw: str) -> list[dict[str, str]]:
 
 def persist_job(db: sqlite3.Connection, job: ReplyJob) -> None:
     values = {name: getattr(job, name) for name in
-              ("key", "connection_id", "chat_id", "text", "delay", "job_id", "answer", "closing_phase", "generated")}
+              ("key", "connection_id", "chat_id", "text", "delay", "job_id", "answer", "closing_phase", "generated", "provider", "profile_handoff")}
     due = time.time() + max(0.0, job.due_at - time.monotonic()) if job.due_at is not None else None
     db.execute("INSERT INTO reply_jobs(job_id,conversation_key,status,data,due_at,created_at) VALUES (?,?,?,?,?,?) "
                "ON CONFLICT(job_id) DO UPDATE SET status=excluded.status,data=excluded.data,due_at=excluded.due_at",
@@ -750,6 +754,24 @@ def load_system_prompt() -> str:
         "names in the optional character description, prompt template and dialogue."
     )
 SYSTEM_PROMPT = load_system_prompt()
+
+
+def load_grok_system_prompt() -> str:
+    override = os.getenv("GROK_SYSTEM_PROMPT", "").strip()
+    if override:
+        return override.replace(r"\n", "\n").replace("{{ROLEPLAY_CHARACTER}}", ROLEPLAY_CHARACTER)
+    path = os.getenv("GROK_SYSTEM_PROMPT_FILE", "grok_prompt.txt")
+    try:
+        with open(path, encoding="utf-8") as prompt_file:
+            return prompt_file.read().strip().replace("{{ROLEPLAY_CHARACTER}}", ROLEPLAY_CHARACTER)
+    except FileNotFoundError:
+        if os.getenv("GROK_SYSTEM_PROMPT_FILE"):
+            raise SystemExit("GROK_SYSTEM_PROMPT_FILE was configured but does not exist") from None
+        return ""
+
+
+GROK_SYSTEM_PROMPT = load_grok_system_prompt()
+
 
 class APIError(RuntimeError):
     def __init__(self, message: str, *, uncertain: bool = False, retry_after: int | None = None):
@@ -946,14 +968,15 @@ def identity_leak(text: str) -> bool:
 
 def ai_reply(history: list[dict[str, str]], user_text: str,
              profile: dict[str, Any] | None = None,
-             cancel_event: threading.Event | None = None) -> str:
+             cancel_event: threading.Event | None = None, *,
+             grok_history: list[dict[str, str]] | None = None) -> str:
     guidance = (
         "Respond naturally to the latest message. Do not turn the conversation into a profile "
         "questionnaire or try to fill every field. Follow the topic, react before asking, "
         "and do not end every reply with a question. The latest user turn may contain "
         "several messages separated by newlines; address them together in one coherent reply."
     )
-    profile = profile or EMPTY_PROFILE
+    profile = merge_profile_update(empty_profile(), profile or EMPTY_PROFILE)
     ready = profile_ready(profile)
     if not ready:
         guidance += (
@@ -971,14 +994,25 @@ def ai_reply(history: list[dict[str, str]], user_text: str,
         "Use natural British English and UK spelling, with occasional slang rather than stereotypes."
     )
     extra_context = profile_context(profile)
-    messages = [{"role": "system", "content": SYSTEM_PROMPT + "\n" + guidance + ("\n" + extra_context if extra_context else "")}]
+    # Never use Llama's profiling transcript as Grok context. The caller must
+    # provide the separately persisted post-handoff Grok history explicitly.
+    model_history = (grok_history or []) if ready else history
+    model_prompt = SYSTEM_PROMPT
+    if ready and GROK_SYSTEM_PROMPT:
+        model_prompt += "\n" + GROK_SYSTEM_PROMPT
+    messages = [{"role": "system", "content": model_prompt + "\n" + guidance + ("\n" + extra_context if extra_context else "")}]
     messages.extend(
         {"role": item["role"], "content": item["content"][-MAX_HISTORY_CHARS_PER_MESSAGE:]}
-        for item in history[-MAX_HISTORY_MESSAGES:]
+        for item in model_history[-MAX_HISTORY_MESSAGES:]
         if item.get("role") in {"user", "assistant"} and isinstance(item.get("content"), str)
         and not (item["role"] == "assistant" and identity_leak(item["content"]))
     )
-    messages.append({"role": "user", "content": user_text[-MAX_TURN_CHARS:]})
+    if ready and not model_history:
+        # The turn completing profiling belongs to Llama too. Do not forward
+        # even that final raw text: bootstrap Grok with validated profile only.
+        messages.append({"role": "user", "content": json.dumps({"client_profile": profile}, ensure_ascii=False)})
+    else:
+        messages.append({"role": "user", "content": user_text[-MAX_TURN_CHARS:]})
     response = model_request({
         "model": XAI_MODEL if ready else LOCAL_MODEL_NAME,
         "messages": messages,
@@ -1115,7 +1149,7 @@ def handle_private_profile_command(message: dict[str, Any]) -> bool:
                 with delivery_lock, state_lock:
                     scheduler.cancel(key)
                     with profile_db() as db:
-                        result = db.execute("UPDATE conversation_state SET phase='profiling',grok_count=0,local_count=0,handoff=NULL,notified=1 WHERE conversation_key=?", (key,))
+                        result = db.execute("UPDATE conversation_state SET phase='profiling',grok_count=0,local_count=0,grok_history='[]',handoff=NULL,notified=1 WHERE conversation_key=?", (key,))
                 send_chat_message(None, BOT_ADMIN_USER_ID, "Resumed." if result.rowcount else "Unknown chat key.")
         return True
     query = parse_profile_query(text)
@@ -1264,7 +1298,7 @@ def process_message(update: dict[str, Any], receipt_id: str | None = None) -> No
                 if normalized == "/stop":
                     with profile_db() as db:
                         chat_state_in(db, key)
-                        db.execute("UPDATE conversation_state SET phase='stopped',transcript='[]',handoff=NULL,notified=1 WHERE conversation_key=?", (key,))
+                        db.execute("UPDATE conversation_state SET phase='stopped',transcript='[]',grok_history='[]',handoff=NULL,notified=1 WHERE conversation_key=?", (key,))
                         clear_incoming_data(db, key, receipt_id)
                     notice = "Stopped. Pending replies and recent context are cleared. Use /start to resume or /forget to clear saved data."
                 else:
@@ -1310,7 +1344,10 @@ def prepare_answer(job: ReplyJob) -> None:
             job.closing_phase = "awaiting_va"
         else:
             is_grok = profile_ready(profile)
-            answer = ai_reply(history, job.text, profile, job.cancelled)
+            job.provider = "xai" if is_grok else "local"
+            separate_history = read_transcript(state["grok_history"]) if is_grok else []
+            job.profile_handoff = is_grok and not separate_history
+            answer = ai_reply(history, job.text, profile, job.cancelled, grok_history=separate_history)
             count_field = "grok_count" if is_grok else "local_count"
             if is_grok and state["grok_count"] + 1 >= GROK_REPLY_LIMIT:
                 answer = answer[:MAX_REPLY_CHARS-len(CLOSING_MESSAGE)-2] + "\n\n" + CLOSING_MESSAGE
@@ -1339,6 +1376,12 @@ def save_delivery(job: ReplyJob) -> None:
         history = read_transcript(state["transcript"])
         history.extend([{"role": "user", "content": redact_text(job.text)},
                         {"role": "assistant", "content": redact_text(job.answer or "")}])
+        grok_history = read_transcript(state["grok_history"])
+        if job.provider == "xai" and job.generated:
+            # The bootstrap user turn was profiling input, not a Grok message.
+            if not job.profile_handoff:
+                grok_history.append({"role": "user", "content": redact_text(job.text)})
+            grok_history.append({"role": "assistant", "content": redact_text(job.answer or "")})
         phase = job.closing_phase or ("grok" if profile_ready(load_client_profile(job.key)) else "profiling")
         report = None
         if job.closing_phase:
@@ -1349,8 +1392,8 @@ def save_delivery(job: ReplyJob) -> None:
                       + ("\nRecent conversation:\n" + json.dumps(history[-12:], ensure_ascii=False)
                          if HANDOFF_INCLUDE_TRANSCRIPT else "\n[Transcript sharing disabled]")
                       + "\nClosing delivered successfully.")
-        db.execute("UPDATE conversation_state SET phase=?,transcript=?,privacy_notified=1,handoff=?,notified=? WHERE conversation_key=?",
-                   (phase, json.dumps(history[-12:], ensure_ascii=False), report, 0 if report else 1, job.key))
+        db.execute("UPDATE conversation_state SET phase=?,transcript=?,grok_history=?,privacy_notified=1,handoff=?,notified=? WHERE conversation_key=?",
+                   (phase, json.dumps(history[-12:], ensure_ascii=False), json.dumps(grok_history[-12:], ensure_ascii=False), report, 0 if report else 1, job.key))
         db.execute("UPDATE reply_jobs SET status='sent',data='{}' WHERE job_id=?", (job.job_id,))
     job.status = "sent"
     cache_history(job.key, history)
