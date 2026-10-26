@@ -1,4 +1,4 @@
-"""Offline regression tests: no Telegram/Ollama/xAI calls or real credentials."""
+"""Offline regression tests: synthetic data and local mock APIs only."""
 import contextlib
 import csv
 import http.client
@@ -20,7 +20,7 @@ from unittest.mock import patch
 SPEC = importlib.util.spec_from_file_location("ginger_business_bot", Path(__file__).with_name("business_bot.py"))
 bot = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = bot
-with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "", "XAI_API_KEY": "", "SYSTEM_PROMPT_FILE": "/nonexistent-ginger-test-prompt"}):
+with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "", "SYSTEM_PROMPT_FILE": "/nonexistent-ginger-test-prompt"}):
     SPEC.loader.exec_module(bot)
 REAL_MODEL_REQUEST = bot.model_request
 
@@ -56,11 +56,11 @@ class BotTests(unittest.TestCase):
         self.patches = [patch.object(bot, name, value) for name, value in {
             "PROFILE_DB_PATH": str(Path(self.tmp.name) / "profiles.sqlite3"),
             "ENABLE_DIRECT_TEST_MODE": True, "PROFILE_EXTRACTION_ENABLED": False,
-            "BOT_ADMIN_USER_ID": 99, "VA_CHAT_ID": 99, "MIN_TYPING_SECONDS": 0,
+            "BOT_ADMIN_USER_ID": 99, "MIN_TYPING_SECONDS": 0,
             "MAX_TYPING_SECONDS": 0, "TYPING_JITTER_SECONDS": 0,
             "POST_GENERATION_PAUSE_MIN_SECONDS": 0, "POST_GENERATION_PAUSE_MAX_SECONDS": 0,
             "REPLY_DELAY_MODE": "sequence", "REPLY_DELAY_SEQUENCE": (0, 0, 0),
-            "HANDOFF_INCLUDE_TRANSCRIPT": False,
+            
             "MAX_PENDING_JOBS": 100, "MAX_PENDING_UPDATES": 100,
         }.items()]
         for item in self.patches:
@@ -68,6 +68,8 @@ class BotTests(unittest.TestCase):
             self.addCleanup(item.stop)
         bot.scheduler = bot.ReplyScheduler()
         bot.histories.clear()
+        bot.admin_tokens.clear()
+        bot.admin_sessions.clear()
         bot.business_owner_ids.clear()
         bot.business_reply_allowed.clear()
         bot.reply_queue = queue.Queue(100)
@@ -75,6 +77,7 @@ class BotTests(unittest.TestCase):
         self.send = patch.object(bot, "send_chat_message").start()
         self.addCleanup(patch.stopall)
         patch.object(bot, "send_typing_action").start()
+        self.telegram = patch.object(bot, "telegram", return_value=True).start()
         self.model = patch.object(bot, "model_request", return_value=response("I’m Ginger. Nice to meet you!")).start()
 
     def rows(self, sql, args=()):
@@ -135,10 +138,10 @@ class BotTests(unittest.TestCase):
     def test_admin_resume_resets_limits_and_pause(self):
         key = "direct-test:42"
         bot.chat_state(key)
-        self.execute("UPDATE conversation_state SET phase='manual_review',grok_count=5 WHERE conversation_key=?", (key,))
+        self.execute("UPDATE conversation_state SET phase='manual_review',local_count=5 WHERE conversation_key=?", (key,))
         bot.process_message(message("/resume_profile " + key, chat_id=99))
         self.assertFalse(bot.paused(key))
-        self.assertEqual(bot.chat_state(key)["grok_count"], 0)
+        self.assertEqual(bot.chat_state(key)["local_count"], 0)
 
     def test_nonadmin_cannot_export_or_resume(self):
         bot.process_message(message("/export_profiles"))
@@ -150,7 +153,6 @@ class BotTests(unittest.TestCase):
         answer = bot.ai_reply([], "What's your name?", bot.empty_profile())
         self.assertEqual(answer, "I'm Ginger!")
         self.assertEqual(self.model.call_count, 2)
-        self.assertEqual(self.model.call_args.kwargs["provider"], "local")
         self.assertIn("Your only character name is Ginger", self.model.call_args.args[0]["messages"][-1]["content"])
 
     def test_repeated_identity_leak_uses_safe_ginger_fallback(self):
@@ -174,12 +176,6 @@ class BotTests(unittest.TestCase):
         self.assertTrue(prompt.endswith("dialogue."))
         self.assertGreater(prompt.index("FINAL IDENTITY RULE"), prompt.index("You are Nidum AI."))
 
-    def test_qualified_chat_uses_xai_otherwise_local(self):
-        bot.ai_reply([], "Hi", qualified())
-        self.assertEqual(self.model.call_args.kwargs["provider"], "xai")
-        p = qualified(); p["age"] = None
-        bot.ai_reply([], "Hi", p)
-        self.assertEqual(self.model.call_args.kwargs["provider"], "local")
 
     def test_profile_validation_handles_untrusted_types_and_underage(self):
         p = bot.merge_profile_update(bot.empty_profile(), {"employment_status": ["employed"], "age": True, "interests": {"add": "not a list"}})
@@ -249,29 +245,6 @@ class BotTests(unittest.TestCase):
         self.assertNotIn(job.key, bot.scheduler.pending)
         self.assertEqual(bot.chat_state(job.key)["phase"], "manual_review")
         self.assertEqual(self.rows("SELECT status FROM reply_jobs"), [("uncertain",)])
-
-    def closing_job(self):
-        job = self.schedule()
-        bot.save_client_profile(job.key, qualified())
-        self.execute("UPDATE conversation_state SET grok_count=? WHERE conversation_key=?", (bot.GROK_REPLY_LIMIT, job.key))
-        return job
-
-    def test_closing_phase_only_committed_after_successful_delivery(self):
-        job = self.closing_job()
-        self.send.side_effect = bot.APIError("HTTP 403")
-        bot.perform_reply(job)
-        self.assertFalse(bot.paused(job.key))
-        self.assertEqual(self.rows("SELECT handoff FROM conversation_state WHERE conversation_key=?", (job.key,)), [(None,)])
-        self.assertEqual(self.rows("SELECT status FROM reply_jobs"), [("failed",)])
-
-    def test_successful_closing_records_transcript_and_handoff(self):
-        job = self.closing_job(); bot.perform_reply(job)
-        self.assertEqual(bot.chat_state(job.key)["phase"], "awaiting_va")
-        self.assertIn(bot.CLOSING_MESSAGE, bot.chat_state(job.key)["transcript"])
-        report = self.rows("SELECT handoff FROM conversation_state")[0][0]
-        self.assertIn("Closing delivered successfully", report)
-        self.assertIn("Transcript sharing disabled", report)
-        self.assertNotIn("Recent conversation:", report)
 
     def test_ambiguous_send_is_not_retried_and_requests_review(self):
         job = self.schedule()
@@ -367,7 +340,6 @@ class BotTests(unittest.TestCase):
         with patch.object(sys, "argv", ["business_bot.py", "--test-local-model"]), contextlib.redirect_stdout(io.StringIO()) as output:
             bot.main()
         self.assertIn("Ginger", output.getvalue())
-        self.assertEqual(self.model.call_args.kwargs["provider"], "local")
 
     def test_http_errors_hide_token_and_ambiguous_flag(self):
         import urllib.error
@@ -378,8 +350,6 @@ class BotTests(unittest.TestCase):
         self.assertNotIn("secret-token", str(caught.exception))
         self.assertTrue(caught.exception.__suppress_context__)
 
-    def test_separate_provider_concurrency(self):
-        self.assertIsNot(bot.model_slots["local"], bot.model_slots["xai"])
 
     def test_webhook_persists_before_ack_and_rejects_overload(self):
         with patch.object(bot, "WEBHOOK_SECRET", "test-secret"), patch.object(bot, "MAX_PENDING_UPDATES", 1):
@@ -412,13 +382,13 @@ class BotTests(unittest.TestCase):
     def test_legacy_database_migration_preserves_profiles(self):
         legacy = str(Path(self.tmp.name) / "legacy.sqlite3")
         with sqlite3.connect(legacy) as db:
-            db.execute("CREATE TABLE conversation_state (conversation_key TEXT PRIMARY KEY, phase TEXT NOT NULL DEFAULT 'profiling', grok_count INTEGER NOT NULL DEFAULT 0, local_count INTEGER NOT NULL DEFAULT 0, transcript TEXT NOT NULL DEFAULT '[]', handoff TEXT, notified INTEGER NOT NULL DEFAULT 0)")
-            db.execute("INSERT INTO conversation_state(conversation_key,phase,grok_count) VALUES ('old','stopped',4)")
+            db.execute("CREATE TABLE conversation_state (conversation_key TEXT PRIMARY KEY, phase TEXT NOT NULL DEFAULT 'profiling', retired_count INTEGER NOT NULL DEFAULT 0, local_count INTEGER NOT NULL DEFAULT 0, transcript TEXT NOT NULL DEFAULT '[]', handoff TEXT, notified INTEGER NOT NULL DEFAULT 0)")
+            db.execute("INSERT INTO conversation_state(conversation_key,phase,retired_count) VALUES ('old','stopped',4)")
         with patch.object(bot, "PROFILE_DB_PATH", legacy):
             bot.initialize_storage()
             bot.initialize_storage()  # Migration is repeatable.
             self.assertEqual(bot.chat_state("old")["phase"], "stopped")
-            self.assertEqual(bot.chat_state("old")["grok_count"], 4)
+            self.assertNotIn("retired_count", {row[1] for row in self.rows("PRAGMA table_info(conversation_state)")})
             bot.scheduler.add("new", None, 1, "hello")
 
     def test_forget_waits_for_inflight_send_then_removes_delivery_records(self):
@@ -487,7 +457,7 @@ with tempfile.TemporaryDirectory() as temp:
     b.REPLY_DELAY_MODE = 'sequence'; b.REPLY_DELAY_SEQUENCE = (0,)
     b.MIN_TYPING_SECONDS = b.MAX_TYPING_SECONDS = b.TYPING_JITTER_SECONDS = 0
     b.POST_GENERATION_PAUSE_MIN_SECONDS = b.POST_GENERATION_PAUSE_MAX_SECONDS = 0
-    b.VA_CHAT_ID = 0
+    b.BOT_ADMIN_USER_ID = 99
     api = http.server.ThreadingHTTPServer(('127.0.0.1', 0), API)
     threading.Thread(target=api.serve_forever, daemon=True).start()
     base = 'http://127.0.0.1:' + str(api.server_port)
@@ -509,28 +479,13 @@ with tempfile.TemporaryDirectory() as temp:
     b.scheduler.shutdown(); api.shutdown(); api.server_close()
 print('HTTP worker integration passed')
 '''
-        env = dict(os.environ, TELEGRAM_BOT_TOKEN="", XAI_API_KEY="", SYSTEM_PROMPT_FILE="/no-test-prompt")
+        env = dict(os.environ, TELEGRAM_BOT_TOKEN="", SYSTEM_PROMPT_FILE="/no-test-prompt")
         result = subprocess.run([sys.executable, "-c", script], cwd=Path(bot.__file__).parent, env=env, capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("HTTP worker integration passed", result.stdout)
 
 
-    def test_extraction_model_is_independent_of_ginger(self):
-        with patch.object(bot, "LOCAL_MODEL_NAME", "ginger"), patch.object(bot, "PROFILE_MODEL_NAME", "qwen2.5:3b"):
-            self.model.return_value = response('{"profile_update":{"age":25}}')
-            update = bot.extract_profile_update("I am 25", bot.empty_profile())
-            self.assertEqual(update["age"], 25)
-            self.assertEqual(self.model.call_args.args[0]["model"], "qwen2.5:3b")
-            self.assertEqual(self.model.call_args.kwargs["provider"], "local")
-            self.model.return_value = response("I'm Ginger!")
-            bot.ai_reply([], "Hello", bot.empty_profile())
-            self.assertEqual(self.model.call_args.args[0]["model"], "ginger")
 
-    def test_age_alone_allows_grok_with_personal_details_optional(self):
-        profile = bot.merge_profile_update(bot.empty_profile(), {"age": 21})
-        self.assertTrue(bot.profile_ready(profile))
-        bot.ai_reply([], "Hi", profile)
-        self.assertEqual(self.model.call_args.kwargs["provider"], "xai")
 
     def test_adult_flag_alone_does_not_replace_numeric_age(self):
         for age in (None, True, "21", 17, 121):
@@ -538,29 +493,7 @@ print('HTTP worker integration passed')
             self.assertFalse(bot.profile_ready(profile))
         self.assertFalse(bot.profile_ready(dict(bot.empty_profile(), age=21, age_confirmed_adult=False)))
 
-    def test_unemployed_and_declined_employment_do_not_close_adult_chats(self):
-        for status in ("unemployed", "declined", "unknown"):
-            with self.subTest(status=status):
-                key = "direct-test:" + str(100 + len(status))
-                profile = dict(bot.empty_profile(), age=25, employment_status=status)
-                bot.save_client_profile(key, profile)
-                bot.chat_state(key)
-                job = bot.scheduler.add(key, None, 100, "hello")
-                bot.perform_reply(job)
-                self.assertIsNone(job.closing_phase)
-                self.assertFalse(bot.paused(key))
-                self.assertEqual(self.model.call_args.kwargs["provider"], "xai")
 
-    def test_extracted_adult_age_routes_directly_to_grok(self):
-        job = self.schedule("I am 25 years old")
-        self.model.side_effect = [response('{"profile_update":{"age":25}}'), response("I'm Ginger. Lovely to meet you!")]
-        with patch.object(bot, "PROFILE_EXTRACTION_ENABLED", True):
-            bot.perform_reply(job)
-        calls = self.model.call_args_list
-        self.assertEqual(calls[0].args[0]["model"], bot.PROFILE_MODEL_NAME)
-        self.assertEqual(calls[1].kwargs["provider"], "xai")
-        self.assertEqual(bot.chat_state(job.key)["grok_count"], 1)
-        self.assertEqual(bot.chat_state(job.key)["local_count"], 0)
 
     def test_underage_chat_does_not_call_conversational_model(self):
         job = self.schedule()
@@ -577,13 +510,6 @@ print('HTTP worker integration passed')
         self.assertIn("Respect a refusal", system)
         self.assertNotIn("Learn these details gradually:", system)
 
-    def test_same_ginger_identity_is_sent_to_both_providers(self):
-        for profile in (bot.empty_profile(), dict(bot.empty_profile(), age=25)):
-            bot.ai_reply([], "Who are you?", profile)
-            system = self.model.call_args.args[0]["messages"][0]["content"]
-            self.assertIn("Ginger", system)
-            self.assertIn("21-year-old British woman from Manchester", system)
-            self.assertIn("UK spelling", system)
 
     def test_preferences_and_boundaries_survive_restart_and_correct(self):
         key = "direct-test:42"
@@ -671,8 +597,8 @@ print('HTTP worker integration passed')
 
     def test_privacy_details_are_available_only_on_request(self):
         admin_control(message("/privacy"))
-        self.assertIn("Notes expire after", self.send.call_args.args[2])
-        self.assertIn("copies already sent", self.send.call_args.args[2])
+        self.assertIn("Profiles expire after", self.send.call_args.args[2])
+        self.assertIn("backups", self.send.call_args.args[2].lower())
 
     def test_ready_reply_recovery_preserves_answer_without_automatic_notice(self):
         job = self.schedule()
@@ -717,7 +643,7 @@ print('HTTP worker integration passed')
             bot.process_message(message("/stop", chat_id=99))
             self.assertTrue(bot.paused("direct-test:99"))
             bot.process_message(message("/privacy", 2, chat_id=99))
-            self.assertIn("Notes expire", self.send.call_args.args[2])
+            self.assertIn("Profiles expire", self.send.call_args.args[2])
             bot.process_message(message("/forget", 3, chat_id=99))
             self.assertTrue(bot.paused("direct-test:99"))
         self.assertEqual(self.send.call_count, 3)
@@ -781,111 +707,21 @@ print('HTTP worker integration passed')
         self.assertEqual({name:hashlib.sha256(text.encode()).hexdigest() for name,text in sections.items()},expected)
 
 
-    def test_grok_bootstrap_receives_only_profile_not_profiling_text(self):
-        profile = dict(bot.empty_profile(), age=25, name="Alex", interests=["music"])
-        local_history = [{"role":"user","content":"PRIVATE_PROFILING_SENTINEL"}, {"role":"assistant","content":"PRIVATE_LLAMA_REPLY"}]
-        bot.ai_reply(local_history,"FINAL_PROFILING_ANSWER",profile)
-        payload = self.model.call_args.args[0]
-        encoded = json.dumps(payload)
-        self.assertNotIn("PRIVATE_PROFILING_SENTINEL",encoded)
-        self.assertNotIn("PRIVATE_LLAMA_REPLY",encoded)
-        self.assertNotIn("FINAL_PROFILING_ANSWER",encoded)
-        self.assertEqual(self.model.call_args.kwargs["provider"],"xai")
-        self.assertEqual(json.loads(payload["messages"][-1]["content"]),{"client_profile":bot.merge_profile_update(bot.empty_profile(),profile)})
-        self.assertEqual(len(payload["messages"]),2)
 
-    def test_grok_subsequent_turn_receives_only_post_handoff_context(self):
-        profile = dict(bot.empty_profile(),age=25)
-        local = [{"role":"user","content":"OLD_PROFILING_SECRET"}]
-        grok = [{"role":"assistant","content":"GROK_REPLY_ONLY"}, {"role":"user","content":"POST_HANDOFF_USER"}]
-        bot.ai_reply(local,"NEW_CLIENT_MESSAGE",profile,grok_history=grok)
-        payload = self.model.call_args.args[0]
-        encoded = json.dumps(payload)
-        self.assertNotIn("OLD_PROFILING_SECRET",encoded)
-        for text in ("GROK_REPLY_ONLY","POST_HANDOFF_USER","NEW_CLIENT_MESSAGE"):
-            self.assertIn(text,encoded)
 
-    def test_identity_retry_cannot_leak_profiling_context(self):
+    def test_identity_retry_keeps_local_conversation_context(self):
         self.model.side_effect=[response("I'm Nidum AI"),response("I'm Ginger")]
         bot.ai_reply([{"role":"user","content":"PRIVATE_LOCAL_TURN"}],"FINAL_LOCAL_ANSWER",dict(bot.empty_profile(),age=25))
         for call in self.model.call_args_list:
-            self.assertNotIn("PRIVATE_LOCAL_TURN",json.dumps(call.args[0]))
-            self.assertNotIn("FINAL_LOCAL_ANSWER",json.dumps(call.args[0]))
+            self.assertIn("PRIVATE_LOCAL_TURN",json.dumps(call.args[0]))
+            self.assertIn("FINAL_LOCAL_ANSWER",json.dumps(call.args[0]))
 
-    def test_grok_instructions_are_not_sent_to_llama_extraction_or_intro(self):
-        with patch.object(bot,"GROK_SYSTEM_PROMPT","GROK_ONLY_INSTRUCTIONS"):
-            bot.ai_reply([],"Hello",bot.empty_profile())
-            self.assertNotIn("GROK_ONLY_INSTRUCTIONS",json.dumps(self.model.call_args.args[0]))
-            self.model.return_value=response('{"profile_update":{}}')
-            bot.extract_profile_update("Hello",bot.empty_profile())
-            self.assertNotIn("GROK_ONLY_INSTRUCTIONS",json.dumps(self.model.call_args.args[0]))
-            self.model.return_value=response("I'm Ginger")
-            bot.ai_reply([],"I am 25",dict(bot.empty_profile(),age=25))
-            self.assertIn("GROK_ONLY_INSTRUCTIONS",self.model.call_args.args[0]["messages"][0]["content"])
 
-    def test_profile_handoff_is_saved_without_the_final_profiling_user_turn(self):
-        job=self.schedule("PRIVATE_LAST_PROFILING_TURN")
-        bot.save_client_profile(job.key,dict(bot.empty_profile(),age=25))
-        bot.perform_reply(job)
-        state=bot.chat_state(job.key)
-        self.assertIn("PRIVATE_LAST_PROFILING_TURN",state["transcript"])
-        self.assertNotIn("PRIVATE_LAST_PROFILING_TURN",state["grok_history"])
-        self.assertEqual(json.loads(state["grok_history"]),[{"role":"assistant","content":job.answer}])
-        self.assertTrue(job.profile_handoff)
-        self.assertEqual(job.provider,"xai")
-        second=bot.scheduler.add(job.key,None,42,"NEW_GROK_PHASE_MESSAGE")
-        bot.perform_reply(second)
-        self.assertIn("NEW_GROK_PHASE_MESSAGE",bot.chat_state(job.key)["grok_history"])
-        self.assertNotIn("PRIVATE_LAST_PROFILING_TURN",json.dumps(self.model.call_args.args[0]))
 
-    def test_grok_history_survives_restart_and_forget_erases_it(self):
-        job=self.schedule("LOCAL_ONLY_TEXT")
-        bot.save_client_profile(job.key,dict(bot.empty_profile(),age=25))
-        bot.perform_reply(job)
-        bot.histories.clear()
-        history=json.loads(bot.chat_state(job.key)["grok_history"])
-        self.assertEqual(history,[{"role":"assistant","content":job.answer}])
-        admin_control(message("/forget",2))
-        self.assertEqual(bot.chat_state(job.key)["grok_history"],"[]")
 
-    def test_admin_resume_does_not_reuse_old_grok_context(self):
-        key="biz:42"
-        bot.chat_state(key)
-        self.execute("UPDATE conversation_state SET phase='awaiting_va',grok_history=? WHERE conversation_key=?",(json.dumps([{"role":"assistant","content":"OLD_GROK_CONTEXT"}]),key))
-        bot.process_message(message("/resume_profile " + key,chat_id=99))
-        self.assertEqual(bot.chat_state(key)["grok_history"],"[]")
 
-    def test_ready_grok_handoff_recovery_preserves_context_boundary(self):
-        job=self.schedule("PRIVATE_PROFILING_COMPLETION")
-        bot.save_client_profile(job.key,dict(bot.empty_profile(),age=25))
-        bot.prepare_answer(job)
-        bot.scheduler=bot.ReplyScheduler();bot.scheduler.restore()
-        restored=bot.scheduler.pending[job.key][0]
-        self.assertEqual(restored.provider,"xai")
-        self.assertTrue(restored.profile_handoff)
-        self.model.reset_mock();bot.perform_reply(restored)
-        self.model.assert_not_called()
-        self.assertNotIn("PRIVATE_PROFILING_COMPLETION",bot.chat_state(job.key)["grok_history"])
 
-    def test_grok_file_and_environment_override(self):
-        path=Path(self.tmp.name)/"grok_prompt.txt";path.write_text("GROK_ONLY {{ROLEPLAY_CHARACTER}}")
-        with patch.dict(os.environ,{"GROK_SYSTEM_PROMPT":"","GROK_SYSTEM_PROMPT_FILE":str(path)}):
-            self.assertIn("GROK_ONLY Ginger",bot.load_grok_system_prompt())
-        with patch.dict(os.environ,{"GROK_SYSTEM_PROMPT":"OVERRIDE\\nSECOND","GROK_SYSTEM_PROMPT_FILE":str(path)}):
-            self.assertEqual(bot.load_grok_system_prompt(),"OVERRIDE\nSECOND")
-        with patch.dict(os.environ,{"GROK_SYSTEM_PROMPT":"","GROK_SYSTEM_PROMPT_FILE":str(path)+"missing"}):
-            with self.assertRaises(SystemExit):bot.load_grok_system_prompt()
 
-    def test_actual_xai_http_payload_excludes_profiling_chats(self):
-        reply={"object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"I'm Ginger"}]}]}
-        with patch.object(bot,"model_request",REAL_MODEL_REQUEST),patch.object(bot,"XAI_API_KEY","test-only-key"),patch.object(bot,"post_json",return_value=reply) as http:
-            bot.ai_reply([{"role":"user","content":"PRIVATE_PROFILING_HISTORY"}],"PRIVATE_COMPLETION_MESSAGE",dict(bot.empty_profile(),age=25))
-        url,payload=http.call_args.args
-        self.assertEqual(url,"https://api.x.ai/v1/responses")
-        self.assertNotIn("PRIVATE_PROFILING_HISTORY",json.dumps(payload))
-        self.assertNotIn("PRIVATE_COMPLETION_MESSAGE",json.dumps(payload))
-        self.assertIn("client_profile",payload["input"][-1]["content"])
-        self.assertFalse(payload["store"])
 
 
     def test_harmless_model_mentions_do_not_trigger_identity_retry(self):
@@ -898,7 +734,7 @@ print('HTTP worker integration passed')
                 self.assertEqual(self.model.call_count,1)
 
     def test_explicit_model_introductions_still_trigger_identity_check(self):
-        for text in ("I'm Nidum AI.", "I’m NidumAI", "My name is Qwen2.5", "Call me Grok.", "I am an AI assistant.", "I'm Dolphin-Mistral.", "Nidum AI", "I have no name."):
+        for text in ("I'm Nidum AI.", "I’m NidumAI", "My name is Qwen2.5", "Call me Claude.", "I am an AI assistant.", "I'm Dolphin-Mistral.", "Nidum AI", "I have no name."):
             with self.subTest(text=text):
                 self.assertTrue(bot.identity_leak(text))
 
@@ -907,16 +743,10 @@ print('HTTP worker integration passed')
         with self.assertLogs(bot.log,level="WARNING") as logs:
             bot.ai_reply([],"PRIVATE_USER_MESSAGE",bot.empty_profile())
         output="\n".join(logs.output)
-        self.assertIn("provider=local",output)
         self.assertIn("model="+bot.LOCAL_MODEL_NAME,output)
         self.assertNotIn("PRIVATE_USER_MESSAGE",output)
         self.assertNotIn("I'm Nidum AI",output)
 
-    def test_model_mentions_in_grok_history_are_preserved(self):
-        previous="I'm Ginger. We can talk about Qwen if you like."
-        bot.ai_reply([],"How does it work?",dict(bot.empty_profile(),age=25),grok_history=[{"role":"assistant","content":previous}])
-        payload=self.model.call_args.args[0]
-        self.assertIn(previous,[entry["content"] for entry in payload["messages"]])
 
 
     def test_llama_context_error_is_classified_without_echoing_body(self):
@@ -985,7 +815,7 @@ print('HTTP worker integration passed')
             with self.assertLogs(bot.log,level="WARNING") as logs:bot.prepare_answer(job)
         output="\n".join(logs.output)
         self.assertIn("HTTP 404",output)
-        self.assertIn("model="+bot.PROFILE_MODEL_NAME,output)
+        self.assertIn("model="+bot.LOCAL_MODEL_NAME,output)
         self.assertNotIn("PRIVATE_CLIENT_MESSAGE",output)
         self.assertEqual(bot.load_client_profile(job.key)["name"],"Alex")
 
@@ -1013,6 +843,432 @@ print('HTTP worker integration passed')
             with self.assertRaises(bot.APIError) as caught:bot.post_json(bot.LOCAL_CHAT_COMPLETIONS_API,{})
         self.assertIn("requested model is unavailable",str(caught.exception))
         self.assertNotIn("PRIVATE_MODEL",str(caught.exception))
+
+
+    def seed_client(self, number=42, *, age=25, username=None, name=None):
+        key=f"biz:{number}"
+        bot.chat_state(key)
+        bot.save_client_identity(key,{"id":number,"username":username or f"alex_{number}"})
+        bot.save_client_profile(key,dict(bot.empty_profile(),age=age,name=name or f"Client {number}"))
+        return key
+
+    def callback(self, data, *, sender=99, chat=99, chat_type="private", query_id="query1"):
+        query={"id":query_id,"data":data,"from":{"id":sender},"message":{"message_id":7,"chat":{"id":chat,"type":chat_type}}}
+        bot.handle_admin_callback(query)
+        return query
+
+    def menu_payload(self):
+        return next(call.args[1] for call in reversed(self.telegram.call_args_list) if call.args[0] in {"sendMessage","editMessageText"})
+
+    def menu_button(self, label):
+        return next(button["callback_data"] for row in self.menu_payload()["reply_markup"]["inline_keyboard"] for button in row if button["text"]==label)
+
+    def test_single_model_transport_overrides_other_model_names(self):
+        with patch.object(bot,"model_request",REAL_MODEL_REQUEST),patch.object(bot,"post_json",return_value=response("I'm Ginger")) as http:
+            bot.model_request({"model":"different-model","messages":[{"role":"user","content":"Hello"}]})
+        self.assertEqual(http.call_args.args[0],bot.LOCAL_CHAT_COMPLETIONS_API)
+        self.assertEqual(http.call_args.args[1]["model"],bot.LOCAL_MODEL_NAME)
+        self.assertFalse(hasattr(bot,"PROFILE_MODEL_NAME"))
+
+    def test_same_ginger_model_is_used_for_chat_and_profile_extraction(self):
+        self.model.return_value=response('{"profile_update":{"age":25}}')
+        bot.extract_profile_update("I am 25",bot.empty_profile())
+        self.assertEqual(self.model.call_args.args[0]["model"],bot.LOCAL_MODEL_NAME)
+        self.assertNotIn("provider",self.model.call_args.kwargs)
+        self.model.return_value=response("I'm Ginger")
+        for profile in (bot.empty_profile(),dict(bot.empty_profile(),age=25)):
+            bot.ai_reply([],"Hello",profile)
+            self.assertEqual(self.model.call_args.args[0]["model"],bot.LOCAL_MODEL_NAME)
+            self.assertNotIn("provider",self.model.call_args.kwargs)
+
+    def test_adult_chat_has_no_removed_provider_reply_limit(self):
+        job=self.schedule()
+        bot.save_client_profile(job.key,dict(bot.empty_profile(),age=25,employment_status="unemployed"))
+        self.execute("UPDATE conversation_state SET local_count=99 WHERE conversation_key=?",(job.key,))
+        bot.perform_reply(job)
+        self.assertEqual(bot.chat_state(job.key)["local_count"],100)
+        self.assertEqual(bot.chat_state(job.key)["phase"],"active")
+        self.assertIsNone(job.closing_phase)
+        self.send.assert_called_once()
+
+    def test_local_cli_runs_without_old_credentials(self):
+        with patch.object(bot,"TELEGRAM_BOT_TOKEN","test-only"),patch.object(bot,"WEBHOOK_URL",""),patch.object(bot,"start_workers"),patch.object(bot,"run_polling"),patch.object(sys,"argv",["business_bot.py"]):
+            bot.main()
+
+    def test_admin_dashboard_displays_collected_clients_and_never_calls_model(self):
+        self.seed_client()
+        with patch.object(bot,"ENABLE_DIRECT_TEST_MODE",False):bot.process_message(message("/admin",chat_id=99))
+        payload=self.menu_payload()
+        self.assertEqual(payload["chat_id"],99)
+        self.assertIn("Collected clients: 1",payload["text"])
+        self.assertIn("All clients",str(payload["reply_markup"]))
+        self.model.assert_not_called()
+        self.assertNotIn("direct-test:99",bot.scheduler.pending)
+
+    def test_nonadmin_cannot_open_dashboard_or_burn_callback_token(self):
+        key=self.seed_client()
+        data=bot.admin_button("Delete","delete_execute",key=key)["callback_data"]
+        bot.process_message(message("/admin"))
+        self.callback(data,sender=42,chat=42)
+        self.assertTrue(bot.client_exists(key))
+        self.assertIn(data[4:],bot.admin_tokens)
+        self.assertEqual(self.telegram.call_args.args[0],"answerCallbackQuery")
+        self.assertIn("Not authorized",self.telegram.call_args.args[1]["text"])
+
+    def test_callbacks_require_both_private_chat_and_matching_admin_id(self):
+        key=self.seed_client()
+        data=bot.admin_button("Pause","pause",key=key)["callback_data"]
+        for sender,chat,kind in ((99,42,"private"),(99,99,"group"),(42,99,"private")):
+            self.callback(data,sender=sender,chat=chat,chat_type=kind)
+            self.assertFalse(bot.paused(key))
+        self.assertIn(data[4:],bot.admin_tokens)
+
+    def test_menu_tokens_expire_and_are_single_use(self):
+        key=self.seed_client()
+        data=bot.admin_button("Pause","pause",key=key)["callback_data"]
+        self.callback(data)
+        self.assertTrue(bot.paused(key))
+        self.callback(data)
+        self.assertIn("Menu expired",self.telegram.call_args.args[1]["text"])
+        data=bot.admin_button("Resume","resume",key=key)["callback_data"]
+        with patch.object(bot.time,"monotonic",return_value=time.monotonic()+bot.ADMIN_STATE_SECONDS+1):
+            self.callback(data)
+        self.assertTrue(bot.paused(key))
+
+    def test_long_keys_use_short_opaque_callback_data(self):
+        key="connection-"+"x"*180+":42"
+        bot.save_client_identity(key,{"id":42,"username":"alex"});bot.chat_state(key)
+        bot.admin_list()
+        payload=self.menu_payload()
+        for row in payload["reply_markup"]["inline_keyboard"]:
+            for button in row:
+                if "callback_data" in button:
+                    self.assertLessEqual(len(button["callback_data"].encode()),64)
+                    self.assertNotIn(key,button["callback_data"])
+
+    def test_client_list_paginates_and_filters(self):
+        for number in range(19):self.seed_client(number,age=None if number==0 else 25)
+        bot.admin_set_paused("biz:1",True)
+        rows,total,page=bot.client_rows(page=2)
+        self.assertEqual((len(rows),total,page),(3,19,2))
+        self.assertEqual(bot.client_rows(scope="paused")[1],1)
+        self.assertEqual(bot.client_rows(scope="active")[1],18)
+        self.assertEqual(bot.client_rows(scope="age")[1],1)
+        self.assertEqual(bot.client_rows(page=999)[2],2)
+
+    def test_search_matches_name_username_id_and_literal_wildcards(self):
+        self.seed_client(42,name="Alice Example",username="alex_42")
+        self.seed_client(43,name="Bob",username="alexX42")
+        for query in ("Alice","@alex_42","biz:42"):
+            self.assertEqual(bot.client_rows(query=query)[1],1)
+        self.assertEqual(bot.client_rows(query="%")[1],0)
+        self.assertEqual(bot.client_rows(query="' OR 1=1 --")[1],0)
+
+    def test_search_text_is_consumed_by_admin_menu_with_direct_mode_off(self):
+        self.seed_client(42,name="Alice")
+        with patch.object(bot,"ENABLE_DIRECT_TEST_MODE",False):
+            bot.process_message(message("/search",chat_id=99))
+            bot.process_message(message("Alice",2,chat_id=99))
+        self.assertIn("1 matches",self.menu_payload()["text"])
+        self.model.assert_not_called()
+        self.assertFalse(bot.scheduler.pending)
+
+    def test_client_details_have_profile_navigation_and_telegram_link(self):
+        key=self.seed_client()
+        profile=bot.load_client_profile(key)
+        profile.update(favorite_music="techno",work_or_studies="work",occupation="chef",field_of_study="math",interests=["music"])
+        bot.save_client_profile(key,profile)
+        bot.admin_client(key)
+        payload=self.menu_payload()
+        self.assertIn("self-reported",payload["text"])
+        self.assertIn("More profile",str(payload["reply_markup"]))
+        self.assertIn("https://t.me/alex_42",str(payload["reply_markup"]))
+        self.assertLessEqual(len(payload["text"]),3000)
+
+    def test_pause_and_resume_cancel_backlog_without_sending_to_client(self):
+        key=self.seed_client()
+        job=bot.scheduler.add(key,"biz",42,"pending")
+        bot.enqueue_update(message("queued",business=True))
+        self.callback(bot.admin_button("Pause","pause",key=key)["callback_data"])
+        self.assertTrue(job.cancelled.is_set())
+        self.assertTrue(bot.paused(key))
+        self.assertFalse(self.rows("SELECT 1 FROM incoming_updates WHERE conversation_key=? AND status='queued'",(key,)))
+        self.callback(bot.admin_button("Resume","resume",key=key)["callback_data"],query_id="q2")
+        self.assertFalse(bot.paused(key))
+        self.assertEqual(bot.load_client_profile(key)["name"],"Client 42")
+        self.send.assert_not_called()
+
+    def test_deletion_requires_confirmation_then_clears_live_data(self):
+        key=self.seed_client()
+        self.execute("INSERT INTO admin_notes(conversation_key,note,created_at) VALUES (?,?,?)",(key,"note",time.time()))
+        bot.scheduler.add(key,"biz",42,"pending")
+        self.callback(bot.admin_button("Delete","delete_confirm",key=key)["callback_data"])
+        self.assertTrue(bot.client_exists(key))
+        confirm=self.menu_button("Confirm deletion")
+        self.callback(confirm,query_id="q2")
+        self.assertFalse(bot.client_exists(key))
+        self.assertFalse(bot.get_admin_notes(key))
+        self.assertFalse(self.rows("SELECT 1 FROM reply_jobs WHERE conversation_key=?",(key,)))
+        self.assertTrue(bot.paused(key))
+        self.send.assert_not_called()
+        with patch.object(bot,"ENABLE_DIRECT_TEST_MODE",False):bot.process_message(message("/resume_profile "+key,chat_id=99))
+        self.assertFalse(bot.paused(key))
+
+    def test_cancel_deletion_keeps_profile(self):
+        key=self.seed_client()
+        self.callback(bot.admin_button("Delete","delete_confirm",key=key)["callback_data"])
+        self.callback(self.menu_button("Cancel"),query_id="q2")
+        self.assertTrue(bot.client_exists(key))
+
+    def test_notes_are_admin_only_bounded_and_not_sent_to_model(self):
+        key=self.seed_client()
+        self.callback(bot.admin_button("Note","note",key=key)["callback_data"])
+        with patch.object(bot,"ENABLE_DIRECT_TEST_MODE",False):bot.process_message(message("INTERNAL_ADMIN_NOTE password=secret123",chat_id=99))
+        notes=bot.get_admin_notes(key)
+        self.assertEqual(len(notes),1)
+        self.assertNotIn("secret123",notes[0])
+        bot.ai_reply([],"Hello",bot.load_client_profile(key))
+        self.assertNotIn("INTERNAL_ADMIN_NOTE",json.dumps(self.model.call_args.args[0]))
+        self.assertEqual(bot.client_rows(query="INTERNAL_ADMIN_NOTE")[1],1)
+
+    def test_csv_includes_identity_only_clients_and_admin_notes(self):
+        key="biz:42";bot.save_client_identity(key,{"id":42,"username":"alex"})
+        self.execute("INSERT INTO admin_notes(conversation_key,note,created_at) VALUES (?,?,?)",(key,"=formula",time.time()))
+        rows=list(csv.DictReader(io.StringIO(bot.profiles_csv().decode("utf-8-sig"))))
+        self.assertEqual(rows[0]["telegram_user_id"],"42")
+        self.assertEqual(rows[0]["admin_notes"],"'=formula")
+
+    def test_export_button_sends_csv_only_to_configured_admin(self):
+        self.seed_client()
+        with patch.object(bot,"send_profile_csv") as export:
+            self.callback(bot.admin_button("Export","export")["callback_data"])
+        export.assert_called_once_with()
+        self.assertEqual(self.menu_payload()["chat_id"],99)
+
+    def test_callback_is_durable_deduplicated_and_does_not_collect_admin(self):
+        key=self.seed_client()
+        data=bot.admin_button("Pause","pause",key=key)["callback_data"]
+        query={"id":"cb1","data":data,"from":{"id":99},"message":{"message_id":1,"chat":{"id":99,"type":"private"}}}
+        bot.enqueue_update({"callback_query":query});bot.enqueue_update({"callback_query":query})
+        records=self.rows("SELECT receipt_id,payload FROM incoming_updates")
+        self.assertEqual(len(records),1)
+        self.assertEqual(records[0][0],"callback:cb1")
+        self.assertFalse(self.rows("SELECT 1 FROM conversation_state WHERE conversation_key='admin:99'"))
+
+    def test_invalid_callback_metadata_is_rejected(self):
+        query={"id":"cb1","data":"x"*65,"from":{"id":99},"message":{"message_id":1,"chat":{"id":99,"type":"private"}}}
+        with self.assertRaises(ValueError):bot.enqueue_update({"callback_query":query})
+
+    def test_menu_and_sessions_are_bounded_and_cancelled(self):
+        with patch.object(bot,"ADMIN_MAX_TOKENS",4):
+            for _ in range(8):bot.admin_button("Menu","dashboard")
+        self.assertLessEqual(len(bot.admin_tokens),4)
+        bot.admin_begin_input("search")
+        bot.process_message(message("/cancel",chat_id=99))
+        self.assertNotIn(99,bot.admin_sessions)
+
+    def test_upgrade_creates_one_recoverable_backup_and_preserves_old_rows(self):
+        legacy=Path(self.tmp.name)/"old.sqlite3"
+        with sqlite3.connect(legacy) as db:
+            db.execute("CREATE TABLE conversation_state(conversation_key TEXT PRIMARY KEY,phase TEXT NOT NULL DEFAULT 'profiling',local_count INTEGER NOT NULL DEFAULT 0,transcript TEXT NOT NULL DEFAULT '[]')")
+            db.execute("INSERT INTO conversation_state(conversation_key,phase) VALUES ('biz:42','stopped')")
+        with patch.object(bot,"PROFILE_DB_PATH",str(legacy)):
+            bot.initialize_storage();bot.initialize_storage()
+        backups=list(Path(self.tmp.name).glob("old.sqlite3.pre-local-menu-*.sqlite3"))
+        self.assertEqual(len(backups),1)
+        with sqlite3.connect(backups[0]) as db:self.assertEqual(db.execute("SELECT phase FROM conversation_state WHERE conversation_key='biz:42'").fetchone()[0],"stopped")
+
+    def test_restart_cancels_prepared_replies_from_removed_provider(self):
+        job=self.schedule()
+        bot.prepare_answer(job)
+        status,data=self.rows("SELECT status,data FROM reply_jobs")[0]
+        values=json.loads(data);values.update(provider="retired_remote",profile_handoff=True)
+        self.execute("UPDATE reply_jobs SET data=?",(json.dumps(values),))
+        bot.scheduler=bot.ReplyScheduler();bot.scheduler.restore()
+        self.assertFalse(bot.scheduler.pending)
+        self.assertEqual(self.rows("SELECT status FROM reply_jobs"),[("cancelled",)])
+        self.send.assert_not_called()
+
+    def test_restart_keeps_legacy_local_replies_without_provider_fields(self):
+        job=self.schedule();bot.prepare_answer(job)
+        values=json.loads(self.rows("SELECT data FROM reply_jobs")[0][0]);values.update(provider="local",profile_handoff=False)
+        self.execute("UPDATE reply_jobs SET data=?",(json.dumps(values),))
+        bot.scheduler=bot.ReplyScheduler();bot.scheduler.restore()
+        restored=bot.scheduler.pending[job.key][0]
+        self.assertEqual(restored.answer,job.answer)
+        self.assertFalse(hasattr(restored,"provider"))
+
+
+    def test_callback_navigation_cancels_pending_note_input(self):
+        key=self.seed_client()
+        bot.admin_begin_input("note",key)
+        self.callback(bot.admin_button("Clients","list")["callback_data"])
+        self.assertNotIn(99,bot.admin_sessions)
+        with patch.object(bot,"ENABLE_DIRECT_TEST_MODE",False):bot.process_message(message("This is not a client note",chat_id=99))
+        self.assertFalse(bot.get_admin_notes(key))
+
+    def test_empty_admin_message_does_not_consume_note_session(self):
+        key=self.seed_client();bot.admin_begin_input("note",key)
+        update=message("",chat_id=99)
+        self.assertFalse(bot.handle_admin_message(update["message"]))
+        self.assertIn(99,bot.admin_sessions)
+        self.assertFalse(bot.get_admin_notes(key))
+
+    def test_callback_acknowledgement_failure_does_not_drop_admin_action(self):
+        key=self.seed_client()
+        def telegram(method,payload,**kwargs):
+            if method=="answerCallbackQuery":raise bot.APIError("temporary acknowledgement failure")
+            return True
+        self.telegram.side_effect=telegram
+        self.callback(bot.admin_button("Pause","pause",key=key)["callback_data"])
+        self.assertTrue(bot.paused(key))
+
+    def test_webhook_accepts_authenticated_callback_and_persists_it(self):
+        with patch.object(bot,"WEBHOOK_SECRET","test-secret"):
+            server=bot.LimitedHTTPServer(("127.0.0.1",0),bot.WebhookHandler)
+            thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+            query={"id":"cb1","data":"adm:token","from":{"id":99},"message":{"message_id":1,"chat":{"id":99,"type":"private"}}}
+            try:
+                conn=http.client.HTTPConnection(*server.server_address,timeout=5)
+                conn.request("POST","/telegram/test-secret",json.dumps({"callback_query":query}),{"X-Telegram-Bot-Api-Secret-Token":"test-secret"})
+                reply=conn.getresponse();self.assertEqual(reply.status,200);reply.read();conn.close()
+                self.assertEqual(self.rows("SELECT receipt_id,status FROM incoming_updates"),[("callback:cb1","queued")])
+            finally:
+                server.shutdown();server.server_close();thread.join(2)
+
+    def test_full_http_worker_admin_menu_pause_resume_and_local_adult_chat(self):
+        script=r'''
+import http.server,json,os,tempfile,threading,time
+import business_bot as b
+class API(http.server.BaseHTTPRequestHandler):
+    calls=[]
+    models=[]
+    def do_POST(self):
+        payload=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        API.calls.append((self.path,payload))
+        if self.path=='/v1/chat/completions':
+            API.models.append(payload['model'])
+            if payload['messages'][0]['content'].startswith('You extract client profile changes'):
+                assert payload['max_tokens']==400
+                text=json.dumps({'profile_update':{'name':'Alex','age':25}})
+            else:text="I'm Ginger. Lovely to chat with you!"
+            result={'choices':[{'message':{'content':text}}]}
+        else:result={'ok':True,'result':{'message_id':10}}
+        data=json.dumps(result).encode()
+        self.send_response(200);self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
+    def log_message(self,*args):pass
+
+def wait_for(predicate):
+    deadline=time.monotonic()+5
+    while time.monotonic()<deadline:
+        value=predicate()
+        if value:return value
+        time.sleep(.01)
+    raise AssertionError('Timed out waiting for worker operation')
+def latest_menu(prefix):
+    return next((payload for path,payload in reversed(API.calls) if path.endswith(('/sendMessage','/editMessageText')) and payload.get('chat_id')==99 and payload.get('text','').startswith(prefix)),None)
+def button(payload,label):
+    return next(item['callback_data'] for row in payload['reply_markup']['inline_keyboard'] for item in row if item['text']==label)
+def cb(data,number):
+    b.enqueue_update({'callback_query':{'id':'cb'+str(number),'data':data,'from':{'id':99},'message':{'message_id':10,'chat':{'id':99,'type':'private'}}}})
+def client(text,number):
+    b.enqueue_update({'message':{'message_id':number,'chat':{'id':42,'type':'private'},'from':{'id':42,'username':'alex'},'text':text}})
+with tempfile.TemporaryDirectory() as tmp:
+    b.PROFILE_DB_PATH=os.path.join(tmp,'state.sqlite3');b.BOT_ADMIN_USER_ID=99
+    b.ENABLE_DIRECT_TEST_MODE=True;b.PROFILE_EXTRACTION_ENABLED=True
+    b.REPLY_DELAY_MODE='sequence';b.REPLY_DELAY_SEQUENCE=(0,)
+    b.MIN_TYPING_SECONDS=b.MAX_TYPING_SECONDS=b.TYPING_JITTER_SECONDS=0
+    b.POST_GENERATION_PAUSE_MIN_SECONDS=b.POST_GENERATION_PAUSE_MAX_SECONDS=0
+    api=http.server.ThreadingHTTPServer(('127.0.0.1',0),API)
+    threading.Thread(target=api.serve_forever,daemon=True).start()
+    base='http://127.0.0.1:'+str(api.server_port)
+    b.TELEGRAM_API=base+'/botTEST';b.LOCAL_CHAT_COMPLETIONS_API=base+'/v1/chat/completions'
+    b.initialize_storage();b.start_workers();client('I am Alex and I am 25',1)
+    wait_for(lambda:b.chat_state('direct-test:42')['phase']=='active')
+    b.enqueue_update({'message':{'message_id':11,'chat':{'id':99,'type':'private'},'from':{'id':99},'text':'/admin'}})
+    dashboard=wait_for(lambda:latest_menu('Ginger · Client manager'))
+    cb(button(dashboard,'All clients'),1)
+    listing=wait_for(lambda:latest_menu('Clients ·'))
+    cb(listing['reply_markup']['inline_keyboard'][0][0]['callback_data'],2)
+    detail=wait_for(lambda:latest_menu('Client:'))
+    cb(button(detail,'Pause'),3)
+    wait_for(lambda:b.paused('direct-test:42'))
+    wait_for(lambda:'Paused / needs review' in (latest_menu('Client:') or {}).get('text',''))
+    cb(button(latest_menu('Client:'),'Resume'),4)
+    wait_for(lambda:not b.paused('direct-test:42'))
+    client_sends=[payload for path,payload in API.calls if path.endswith('/sendMessage') and payload.get('chat_id')==42]
+    assert len(client_sends)==1,client_sends
+    client('Hello again',2)
+    wait_for(lambda:len([p for path,p in API.calls if path.endswith('/sendMessage') and p.get('chat_id')==42])==2)
+    assert API.models and set(API.models)=={b.LOCAL_MODEL_NAME},API.models
+    assert len(API.models)==4,API.models
+    assert all(thread.is_alive() for thread in b.runtime_threads)
+    b.scheduler.shutdown();api.shutdown();api.server_close()
+print('Local-only profile/chat and admin callback integration passed')
+'''
+        environment=dict(os.environ,TELEGRAM_BOT_TOKEN="",SYSTEM_PROMPT_FILE="/no-test-prompt")
+        result=subprocess.run([sys.executable,"-c",script],cwd=Path(bot.__file__).parent,env=environment,capture_output=True,text=True,timeout=15)
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertIn("admin callback integration passed",result.stdout)
+
+
+    def test_navigation_commands_cancel_pending_note_for_other_client(self):
+        first=self.seed_client(42);second=self.seed_client(43)
+        commands=("/profile @alex_43","/search Client","/resume_profile "+second,"/export_profiles","/privacy","/unknown")
+        with patch.object(bot,"send_profile_csv"):
+            for command in commands:
+                with self.subTest(command=command):
+                    bot.admin_begin_input("note",first)
+                    bot.handle_admin_message(message(command,chat_id=99)["message"])
+                    self.assertNotIn(99,bot.admin_sessions)
+                    with patch.object(bot,"ENABLE_DIRECT_TEST_MODE",False):
+                        bot.process_message(message("Not a note for client 42",chat_id=99))
+                    self.assertFalse(bot.get_admin_notes(first))
+
+    def test_upgrade_removes_retired_live_payload_columns_after_backup(self):
+        legacy=Path(self.tmp.name)/"retired.sqlite3"
+        with sqlite3.connect(legacy) as db:
+            db.execute("CREATE TABLE conversation_state(conversation_key TEXT PRIMARY KEY,phase TEXT NOT NULL DEFAULT 'profiling',local_count INTEGER NOT NULL DEFAULT 0,transcript TEXT NOT NULL DEFAULT '[]',retired_payload TEXT)")
+            db.execute("INSERT INTO conversation_state(conversation_key,phase,transcript,retired_payload) VALUES (?,?,?,?)",("biz:42","stopped",'[{"role":"user","content":"Keep supported context"}]',"RETIRED_PRIVATE_CHAT"))
+        with patch.object(bot,"PROFILE_DB_PATH",str(legacy)):
+            bot.initialize_storage()
+            self.assertEqual({row[1] for row in self.rows("PRAGMA table_info(conversation_state)")},set(bot.CONVERSATION_DEFINITIONS))
+            self.assertIn("Keep supported context",bot.chat_state("biz:42")["transcript"])
+            bot.delete_client_profile("biz:42")
+            self.assertEqual(bot.chat_state("biz:42")["transcript"],"[]")
+        backup=next(Path(self.tmp.name).glob("retired.sqlite3.pre-local-menu-*.sqlite3"))
+        with sqlite3.connect(backup) as db:
+            self.assertEqual(db.execute("SELECT retired_payload FROM conversation_state").fetchone()[0],"RETIRED_PRIVATE_CHAT")
+
+    def test_callback_retries_keep_token_when_database_action_fails(self):
+        key=self.seed_client()
+        data=bot.admin_button("Pause","pause",key=key)["callback_data"]
+        original=bot.admin_set_paused
+        count=0
+        def transient(*args):
+            nonlocal count
+            count+=1
+            if count==1:raise sqlite3.OperationalError("database locked")
+            return original(*args)
+        with patch.object(bot,"admin_set_paused",side_effect=transient):
+            with self.assertRaises(sqlite3.OperationalError):self.callback(data)
+            self.assertIn(data[4:],bot.admin_tokens)
+            self.assertFalse(bot.paused(key))
+            self.callback(data)
+        self.assertTrue(bot.paused(key))
+        self.assertNotIn(data[4:],bot.admin_tokens)
+
+    def test_callback_render_retry_does_not_repeat_committed_resume_or_drop_new_input(self):
+        key=self.seed_client();bot.admin_set_paused(key,True)
+        data=bot.admin_button("Resume","resume",key=key)["callback_data"]
+        original_client=bot.admin_client
+        with patch.object(bot,"admin_client",side_effect=[sqlite3.OperationalError("database locked"),None]),patch.object(bot,"admin_set_paused",wraps=bot.admin_set_paused) as resume:
+            with self.assertRaises(sqlite3.OperationalError):self.callback(data)
+            self.assertFalse(bot.paused(key))
+            bot.enqueue_update(message("New message after resume",business=True))
+            self.callback(data)
+            self.assertEqual(resume.call_count,1)
+        self.assertTrue(self.rows("SELECT 1 FROM incoming_updates WHERE conversation_key=? AND status='queued'",(key,)))
 
 
 if __name__ == "__main__":

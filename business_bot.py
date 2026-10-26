@@ -1,10 +1,6 @@
-"""Telegram Business roleplay assistant.
-Ollama writes introductory replies and extracts profiles; Grok takes over when ready.
-Profiles are stored in SQLite. Messages received during
-a configured reply delay are combined into one turn.
-For Grok, place XAI_API_KEY in .env. XAI_MODEL defaults to grok-4.3.
-Run `python business_bot.py --test-model` to test the selected model without
-starting Telegram polling.
+"""Local Ginger Telegram Business assistant and private admin client manager.
+The same local model handles profile extraction and all conversational replies.
+Run python business_bot.py --test-model or --test-profile-model without Telegram.
 """
 from __future__ import annotations
 import json
@@ -25,7 +21,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 import urllib.error
 import urllib.request
 from collections import defaultdict, deque
@@ -53,29 +49,16 @@ def load_env_file(path: str = ".env") -> None:
 load_env_file()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 LOCAL_MODEL_BASE_URL = "".join(
-    os.getenv("LOCAL_MODEL_BASE_URL", "http://127.0.0.1:11434/v1").split()
+    os.getenv("LOCAL_MODEL_BASE_URL", "http://127.0.0.1:8080/v1").split()
 ).rstrip("/")
 LOCAL_MODEL_NAME = os.getenv(
     "LOCAL_MODEL_NAME",
     "ginger",
 )
-PROFILE_MODEL_NAME = os.getenv("PROFILE_MODEL_NAME", "qwen2.5:3b").strip()
-if not LOCAL_MODEL_NAME.strip() or not PROFILE_MODEL_NAME:
-    raise SystemExit("LOCAL_MODEL_NAME and PROFILE_MODEL_NAME must not be empty")
-MODEL_PROVIDER = "xai"  # ai_reply chooses local for introductions and xAI once qualified.
-XAI_API_KEY = os.getenv("XAI_API_KEY", "").strip()
-XAI_MODEL = os.getenv("XAI_MODEL", "grok-4.3").strip()
-XAI_REASONING_EFFORT = os.getenv("XAI_REASONING_EFFORT", "none").strip().lower()
-XAI_TIMEOUT_SECONDS = max(30, int(os.getenv("XAI_TIMEOUT_SECONDS", "180")))
-if not XAI_MODEL:
-    raise SystemExit("XAI_MODEL cannot be empty")
-if XAI_REASONING_EFFORT not in {"", "none", "low", "medium", "high", "xhigh"}:
-    raise SystemExit("XAI_REASONING_EFFORT must be none, low, medium, high, xhigh, or empty")
-MODEL_NAME = XAI_MODEL if MODEL_PROVIDER == "xai" else LOCAL_MODEL_NAME
+if not LOCAL_MODEL_NAME.strip():
+    raise SystemExit("LOCAL_MODEL_NAME must not be empty")
 ROLEPLAY_CHARACTER = os.getenv("ROLEPLAY_CHARACTER", "Ginger, a fictional 21-year-old British woman from Manchester; warm, witty, playful, interested in R&B and techno.")
 BOT_ADMIN_USER_ID = int(os.getenv("BOT_ADMIN_USER_ID", "0"))
-VA_CHAT_ID = int(os.getenv("VA_CHAT_ID", str(BOT_ADMIN_USER_ID)))
-GROK_REPLY_LIMIT = max(1, int(os.getenv("GROK_REPLY_LIMIT", "5")))
 PROFILING_REPLY_LIMIT = max(1, int(os.getenv("PROFILING_REPLY_LIMIT", "12")))
 CLOSING_MESSAGE = "Gotta head to work now, but you’ve made it very tempting to stay 😘 Talk soon?"
 QUALIFIED_EMPLOYMENT = {"employed", "self_employed", "freelancer"}
@@ -115,11 +98,7 @@ if REPLY_DELAY_MODE not in {"random", "sequence"}:
 if not all(math.isfinite(x) for x in (REPLY_DELAY_MIN_SECONDS, REPLY_DELAY_MAX_SECONDS)):
     raise SystemExit("Reply delays must be finite numbers of seconds")
 MODEL_CONCURRENCY = max(1, int(os.getenv("MODEL_CONCURRENCY", "1")))
-# A slow local model must not occupy Grok's concurrency allowance.
-model_slots = {
-    "local": threading.BoundedSemaphore(MODEL_CONCURRENCY),
-    "xai": threading.BoundedSemaphore(MODEL_CONCURRENCY),
-}
+model_slots = threading.BoundedSemaphore(MODEL_CONCURRENCY)
 PROFILE_DB_PATH = os.getenv("PROFILE_DB_PATH", "client_profiles.sqlite3")
 LOCAL_MODEL_TIMEOUT_SECONDS = max(30, int(os.getenv("LOCAL_MODEL_TIMEOUT_SECONDS", "180")))
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
@@ -129,7 +108,6 @@ MAX_PENDING_JOBS = max(1, int(os.getenv("MAX_PENDING_JOBS", "1000")))
 MAX_TURN_CHARS = max(4096, int(os.getenv("MAX_TURN_CHARS", "16000")))
 PLAN_MEMORY_DAYS = max(1, int(os.getenv("PLAN_MEMORY_DAYS", "7")))
 PROFILE_RETENTION_DAYS = max(1, int(os.getenv("PROFILE_RETENTION_DAYS", "30")))
-HANDOFF_INCLUDE_TRANSCRIPT = os.getenv("HANDOFF_INCLUDE_TRANSCRIPT", "false").lower() == "true"
 
 # Bounded caches; SQLite remains the source of truth after eviction/restarts.
 histories: dict[str, deque[dict[str, str]]] = {}
@@ -142,7 +120,7 @@ business_reply_allowed: dict[str, bool] = {}
 
 def redact_text(text: str) -> str:
     """Best-effort removal of common credentials/contact details, not a DLP guarantee."""
-    for secret in (TELEGRAM_BOT_TOKEN, XAI_API_KEY, WEBHOOK_SECRET):
+    for secret in (TELEGRAM_BOT_TOKEN, WEBHOOK_SECRET):
         if secret:
             text = text.replace(secret, "[redacted]")
     text = re.sub(r"(?i)\b(?:sk-[a-z0-9_-]{12,}|[0-9]{6,}:[a-z0-9_-]{20,})\b", "[redacted token]", text)
@@ -171,8 +149,6 @@ class ReplyJob:
     answer: str | None = None
     closing_phase: str | None = None
     generated: bool = False
-    provider: str | None = None
-    profile_handoff: bool = False
     status: str = "pending"
     due_at: float | None = None
     sent_at: float | None = None
@@ -270,12 +246,18 @@ class ReplyScheduler:
                 rows = db.execute("SELECT job_id,status,data,due_at FROM reply_jobs WHERE status IN ('pending','generating','ready','sending') ORDER BY rowid").fetchall()
                 for job_id, status, data, due in rows:
                     values = json.loads(data)
-                    job = ReplyJob(**values)
+                    provider = values.get("provider")
+                    if status != "sending" and provider not in (None, "local"):
+                        # Do not send prepared replies produced by a removed provider.
+                        db.execute("UPDATE reply_jobs SET status='cancelled',data='{}' WHERE job_id=?", (job_id,))
+                        continue
+                    allowed = {item.name for item in fields(ReplyJob)}
+                    job = ReplyJob(**{name: value for name, value in values.items() if name in allowed})
                     if status == "sending":
                         # Telegram has no idempotency key: delivery may have succeeded.
                         db.execute("UPDATE reply_jobs SET status='uncertain',data='{}' WHERE job_id=?", (job_id,))
                         chat_state_in(db, job.key)
-                        db.execute("UPDATE conversation_state SET phase='manual_review',handoff=?,notified=0 WHERE conversation_key=?",
+                        db.execute("UPDATE conversation_state SET phase='manual_review',review_reason=? WHERE conversation_key=?",
                                    (f"Delivery uncertain after restart: {job.key}. Check Telegram and use /resume_profile {job.key}.", job.key))
                         continue
                     job.status = "ready" if job.answer is not None else "pending"
@@ -500,7 +482,8 @@ def clear_incoming_data(db: sqlite3.Connection, key: str, receipt_id: str | None
 def delete_client_profile(key: str, receipt_id: str | None = None) -> None:
     with profile_db() as connection:
         chat_state_in(connection, key)
-        connection.execute("UPDATE conversation_state SET phase='stopped',transcript='[]',grok_history='[]',handoff=NULL,notified=1,grok_count=0,local_count=0,privacy_notified=0 WHERE conversation_key=?", (key,))
+        connection.execute("UPDATE conversation_state SET phase='stopped',transcript='[]',review_reason='',local_count=0 WHERE conversation_key=?", (key,))
+        connection.execute("DELETE FROM admin_notes WHERE conversation_key=?", (key,))
         connection.execute("DELETE FROM client_profiles WHERE conversation_key=?", (key,))
         connection.execute("DELETE FROM profile_memory_timestamps WHERE conversation_key=?", (key,))
         connection.execute("DELETE FROM client_identities WHERE conversation_key=?", (key,))
@@ -563,7 +546,7 @@ def extract_profile_update(user_text: str, current_profile: dict[str, Any],
         "{\"profile_update\": {\"favorite_music\": \"techno\"}}."
     )
     payload = {
-        "model": PROFILE_MODEL_NAME,
+        "model": LOCAL_MODEL_NAME,
         "messages": [
             {"role": "system", "content": instructions},
             {"role": "user", "content": json.dumps({
@@ -577,14 +560,14 @@ def extract_profile_update(user_text: str, current_profile: dict[str, Any],
                 "latest_user_answer": user_text,
             }, ensure_ascii=False)},
         ],
-        "max_tokens": 600,
+        "max_tokens": 400,
         "temperature": 0.7,
         # Request JSON through the prompt and validate it below. Avoid server-side
         # JSON grammar sampling: some local builds fail with an empty grammar stack.
         "stream": False,
     }
     try:
-        response = model_request(payload, cancel_event, provider="local")
+        response = model_request(payload, cancel_event)
     except APIError as exc:
         if not exc.context_exceeded:
             raise
@@ -596,7 +579,7 @@ def extract_profile_update(user_text: str, current_profile: dict[str, Any],
         log.warning("Profile request exceeded the context window; retrying once without previous dialogue")
         request_data["recent_dialogue_for_context"] = []
         payload["messages"][1]["content"] = json.dumps(request_data, ensure_ascii=False)
-        response = model_request(payload, cancel_event, provider="local")
+        response = model_request(payload, cancel_event)
     content = model_content(response)
     if content.startswith("```"):
         content = "\n".join(content.splitlines()[1:])
@@ -629,34 +612,76 @@ def profile_context(profile: dict[str, Any]) -> str:
         "Plans and events may be outdated; confirm their status before treating them as current: "
         + json.dumps(visible, ensure_ascii=False)
     )
-def initialize_handoff_store() -> None:
+CONVERSATION_DEFINITIONS = {
+    "conversation_key": "TEXT PRIMARY KEY",
+    "phase": "TEXT NOT NULL DEFAULT 'profiling'",
+    "local_count": "INTEGER NOT NULL DEFAULT 0",
+    "transcript": "TEXT NOT NULL DEFAULT '[]'",
+    "last_activity": "REAL NOT NULL DEFAULT 0",
+    "delay_turn": "INTEGER NOT NULL DEFAULT 0",
+    "review_reason": "TEXT NOT NULL DEFAULT ''",
+}
+
+
+def initialize_conversation_store() -> None:
     with profile_db() as db:
-        db.execute("CREATE TABLE IF NOT EXISTS conversation_state (conversation_key TEXT PRIMARY KEY, phase TEXT NOT NULL DEFAULT 'profiling', grok_count INTEGER NOT NULL DEFAULT 0, local_count INTEGER NOT NULL DEFAULT 0, transcript TEXT NOT NULL DEFAULT '[]', handoff TEXT, notified INTEGER NOT NULL DEFAULT 0)")
+        db.execute("BEGIN IMMEDIATE")
+        definition = ",".join(name+" "+declaration for name,declaration in CONVERSATION_DEFINITIONS.items())
+        db.execute("CREATE TABLE IF NOT EXISTS conversation_state ("+definition+")")
         columns = {row[1] for row in db.execute("PRAGMA table_info(conversation_state)")}
-        if "last_activity" not in columns:
-            db.execute("ALTER TABLE conversation_state ADD COLUMN last_activity REAL NOT NULL DEFAULT 0")
-            db.execute("UPDATE conversation_state SET last_activity=? WHERE last_activity=0", (time.time(),))
-        if "delay_turn" not in columns:
-            db.execute("ALTER TABLE conversation_state ADD COLUMN delay_turn INTEGER NOT NULL DEFAULT 0")
-        if "grok_history" not in columns:
-            db.execute("ALTER TABLE conversation_state ADD COLUMN grok_history TEXT NOT NULL DEFAULT '[]'")
-        if "privacy_notified" not in columns:
-            db.execute("ALTER TABLE conversation_state ADD COLUMN privacy_notified INTEGER NOT NULL DEFAULT 0")
+        if "conversation_key" not in columns:
+            raise ValueError("Conversation database has no conversation_key column")
+        for name,declaration in CONVERSATION_DEFINITIONS.items():
+            if name not in columns:
+                db.execute(f"ALTER TABLE conversation_state ADD COLUMN {name} {declaration}")
+        if columns - set(CONVERSATION_DEFINITIONS):
+            # The pre-upgrade SQLite backup retains the original schema/data.
+            # Only the supported local fields remain in the live conversation
+            # table, so deleting a client cannot leave retired chat payloads.
+            temporary = "_conversation_upgrade_"+uuid.uuid4().hex
+            db.execute("CREATE TABLE "+temporary+" ("+definition+")")
+            names = ",".join(CONVERSATION_DEFINITIONS)
+            db.execute("INSERT INTO "+temporary+" ("+names+") SELECT "+names+" FROM conversation_state")
+            db.execute("DROP TABLE conversation_state")
+            db.execute("ALTER TABLE "+temporary+" RENAME TO conversation_state")
+        db.execute("UPDATE conversation_state SET last_activity=? WHERE last_activity=0", (time.time(),))
+        db.execute("UPDATE conversation_state SET phase=CASE WHEN phase IN ('profiling','active','stopped','manual_review') THEN phase WHEN phase IN ('awaiting_va','unqualified') THEN 'manual_review' ELSE 'active' END")
         db.execute("CREATE TABLE IF NOT EXISTS incoming_updates (receipt_id TEXT PRIMARY KEY, conversation_key TEXT NOT NULL, status TEXT NOT NULL, payload TEXT NOT NULL, created_at REAL NOT NULL)")
         db.execute("CREATE INDEX IF NOT EXISTS incoming_status_idx ON incoming_updates(status,created_at)")
         db.execute("CREATE TABLE IF NOT EXISTS reply_jobs (job_id TEXT PRIMARY KEY, conversation_key TEXT NOT NULL, status TEXT NOT NULL, data TEXT NOT NULL, due_at REAL, created_at REAL NOT NULL)")
         db.execute("CREATE INDEX IF NOT EXISTS reply_job_status_idx ON reply_jobs(status)")
+        db.execute("CREATE TABLE IF NOT EXISTS admin_notes (id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_key TEXT NOT NULL, note TEXT NOT NULL, created_at REAL NOT NULL)")
+        db.execute("CREATE INDEX IF NOT EXISTS admin_note_client_idx ON admin_notes(conversation_key,id)")
+
+
+def backup_before_upgrade() -> None:
+    if not os.path.isfile(PROFILE_DB_PATH):
+        return
+    with sqlite3.connect(PROFILE_DB_PATH) as original:
+        tables = {row[0] for row in original.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if not tables:
+            return
+        columns = {row[1] for row in original.execute("PRAGMA table_info(conversation_state)")}
+        if columns == set(CONVERSATION_DEFINITIONS) and "admin_notes" in tables:
+            return
+        backup_path = PROFILE_DB_PATH + ".pre-local-menu-" + time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8] + ".sqlite3"
+        descriptor = os.open(backup_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(descriptor)
+        with sqlite3.connect(backup_path) as backup:
+            original.backup(backup)
+        log.info("Database backup saved before upgrade: %s", backup_path)
 
 
 def initialize_storage() -> None:
+    backup_before_upgrade()
     initialize_profile_store()
-    initialize_handoff_store()
+    initialize_conversation_store()
 
 
 def chat_state_in(db: sqlite3.Connection, key: str) -> dict[str, Any]:
     db.execute("INSERT OR IGNORE INTO conversation_state(conversation_key,last_activity) VALUES (?,?)", (key, time.time()))
-    row = db.execute("SELECT phase,grok_count,local_count,transcript,privacy_notified,grok_history FROM conversation_state WHERE conversation_key=?", (key,)).fetchone()
-    return dict(zip(("phase", "grok_count", "local_count", "transcript", "privacy_notified", "grok_history"), row))
+    row = db.execute("SELECT phase,local_count,transcript,review_reason FROM conversation_state WHERE conversation_key=?", (key,)).fetchone()
+    return dict(zip(("phase", "local_count", "transcript", "review_reason"), row))
 
 
 def chat_state(key: str) -> dict[str, Any]:
@@ -679,7 +704,7 @@ def read_transcript(raw: str) -> list[dict[str, str]]:
 
 def persist_job(db: sqlite3.Connection, job: ReplyJob) -> None:
     values = {name: getattr(job, name) for name in
-              ("key", "connection_id", "chat_id", "text", "delay", "job_id", "answer", "closing_phase", "generated", "provider", "profile_handoff")}
+              ("key", "connection_id", "chat_id", "text", "delay", "job_id", "answer", "closing_phase", "generated")}
     due = time.time() + max(0.0, job.due_at - time.monotonic()) if job.due_at is not None else None
     db.execute("INSERT INTO reply_jobs(job_id,conversation_key,status,data,due_at,created_at) VALUES (?,?,?,?,?,?) "
                "ON CONFLICT(job_id) DO UPDATE SET status=excluded.status,data=excluded.data,due_at=excluded.due_at",
@@ -711,30 +736,14 @@ def cleanup_expired_data() -> None:
             db.execute("DELETE FROM reply_jobs WHERE status NOT IN ('pending','generating','ready','sending') AND created_at<?", (time.time() - 86400,))
 
 
-def handoff_worker() -> None:
-    last_cleanup = 0.0
+def maintenance_worker() -> None:
     while True:
         try:
-            if time.monotonic() - last_cleanup >= 3600:
-                cleanup_expired_data()
-                last_cleanup = time.monotonic()
-            if VA_CHAT_ID:
-                with profile_db() as db:
-                    keys = db.execute("SELECT conversation_key FROM conversation_state WHERE notified=0 AND handoff IS NOT NULL").fetchall()
-                for (key,) in keys:
-                    with delivery_lock:
-                        with profile_db() as db:
-                            row = db.execute("SELECT handoff FROM conversation_state WHERE conversation_key=? AND notified=0", (key,)).fetchone()
-                        if not row or not row[0]:
-                            continue
-                        report = row[0]
-                        for start in range(0, len(report), MAX_REPLY_CHARS):
-                            send_chat_message(None, VA_CHAT_ID, report[start:start+MAX_REPLY_CHARS])
-                        with profile_db() as db:
-                            db.execute("UPDATE conversation_state SET notified=1 WHERE conversation_key=? AND handoff=?", (key, report))
+            cleanup_expired_data()
+            expire_admin_state()
         except Exception:
-            log.exception("VA handoff/retention failed; will retry")
-        time.sleep(30)
+            log.exception("Retention/maintenance failed; will retry")
+        time.sleep(60)
 
 
 def load_system_prompt() -> str:
@@ -773,23 +782,6 @@ def load_system_prompt() -> str:
         "names in the optional character description, prompt template and dialogue."
     )
 SYSTEM_PROMPT = load_system_prompt()
-
-
-def load_grok_system_prompt() -> str:
-    override = os.getenv("GROK_SYSTEM_PROMPT", "").strip()
-    if override:
-        return override.replace(r"\n", "\n").replace("{{ROLEPLAY_CHARACTER}}", ROLEPLAY_CHARACTER)
-    path = os.getenv("GROK_SYSTEM_PROMPT_FILE", "grok_prompt.txt")
-    try:
-        with open(path, encoding="utf-8") as prompt_file:
-            return prompt_file.read().strip().replace("{{ROLEPLAY_CHARACTER}}", ROLEPLAY_CHARACTER)
-    except FileNotFoundError:
-        if os.getenv("GROK_SYSTEM_PROMPT_FILE"):
-            raise SystemExit("GROK_SYSTEM_PROMPT_FILE was configured but does not exist") from None
-        return ""
-
-
-GROK_SYSTEM_PROMPT = load_grok_system_prompt()
 
 
 class APIError(RuntimeError):
@@ -839,7 +831,7 @@ def post_json(url: str, payload: dict[str, Any], headers: dict[str, str] | None 
                 if type(value) is int and 0 < value <= 100_000_000:
                     detail += f"; {field}={value}"
         elif "model" in message and any(marker in message for marker in ("not found", "does not exist", "unknown model")):
-            detail += ": requested model is unavailable; check the server alias and PROFILE_MODEL_NAME"
+            detail += ": requested model is unavailable; check the server alias and LOCAL_MODEL_NAME"
         elif "loading model" in message or "model is loading" in message:
             detail += ": model is still loading"
         elif any(marker in message for marker in ("out of memory", "out of device memory")):
@@ -879,73 +871,31 @@ def post_json(url: str, payload: dict[str, Any], headers: dict[str, str] | None 
 class ReplyCancelled(Exception):
     pass
 
-def model_request(payload: dict[str, Any], cancel_event: threading.Event | None = None,
-                  provider: str | None = None) -> dict[str, Any]:
-    selected_provider = provider or MODEL_PROVIDER
-    if selected_provider not in {"local", "xai"}:
-        raise APIError("Model provider must be xai or local")
-    if selected_provider == "xai" and not XAI_API_KEY:
-        raise APIError("Set XAI_API_KEY to use Grok")
-    slots = model_slots[selected_provider]
-    while not slots.acquire(timeout=0.5):
+def model_request(payload: dict[str, Any], cancel_event: threading.Event | None = None) -> dict[str, Any]:
+    while not model_slots.acquire(timeout=0.5):
         if cancel_event is not None and cancel_event.is_set():
             raise ReplyCancelled
     try:
         if cancel_event is not None and cancel_event.is_set():
             raise ReplyCancelled
-        if selected_provider == "xai":
-            xai_payload: dict[str, Any] = {
-                "model": XAI_MODEL,
-                "input": payload["messages"],
-                "max_output_tokens": payload.get("max_tokens", 300),
-                "temperature": payload.get("temperature", 0.6),
-                "store": False,
-                "stream": False,
-            }
-            if "top_p" in payload:
-                xai_payload["top_p"] = payload["top_p"]
-            if XAI_REASONING_EFFORT:
-                xai_payload["reasoning"] = {"effort": XAI_REASONING_EFFORT}
-            return post_json(
-                "https://api.x.ai/v1/responses",
-                xai_payload,
-                headers={"Authorization": f"Bearer {XAI_API_KEY}"},
-                timeout=XAI_TIMEOUT_SECONDS,
-            )
+        # A single endpoint/model is used for both chat and structured extraction.
+        payload = dict(payload, model=LOCAL_MODEL_NAME)
         return post_json(LOCAL_CHAT_COMPLETIONS_API, payload, timeout=LOCAL_MODEL_TIMEOUT_SECONDS)
     finally:
-        slots.release()
+        model_slots.release()
+
 
 def model_content(response: dict[str, Any]) -> str:
-    if response.get("object") == "response" or "output" in response:
-        if response.get("error") or response.get("status") != "completed":
-            raise APIError("Grok did not complete the response; check the API key, account balance, and model settings")
-        output = response.get("output")
-        if not isinstance(output, list):
-            raise APIError("Grok response output was not a list")
-        texts: list[str] = []
-        for item in output:
-            if not isinstance(item, dict) or item.get("type") != "message" or item.get("role") != "assistant":
-                continue
-            content = item.get("content", [])
-            if not isinstance(content, list):
-                continue
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "output_text" and isinstance(part.get("text"), str):
-                    texts.append(part["text"])
-                elif isinstance(part, dict) and part.get("type") == "refusal":
-                    raise APIError("Grok declined this request")
-        return "\n".join(texts).strip()
+    if response.get("error"):
+        raise APIError("Local model returned an error response")
     choices = response.get("choices") or []
     first = choices[0] if isinstance(choices, list) and choices else {}
     message = first.get("message", {}) if isinstance(first, dict) else {}
     answer = message.get("content", "") if isinstance(message, dict) else ""
     if isinstance(answer, list):
-        answer = "\n".join(
-            part["text"] for part in answer
-            if isinstance(part, dict) and isinstance(part.get("text"), str)
-        )
+        answer = "\n".join(part["text"] for part in answer if isinstance(part, dict) and isinstance(part.get("text"), str))
     return answer.strip() if isinstance(answer, str) else ""
+
 
 def telegram(method: str, payload: dict[str, Any], timeout: int = 45) -> Any:
     result = post_json(f"{TELEGRAM_API}/{method}", payload, timeout=timeout)
@@ -1003,7 +953,7 @@ def business_message_text(message: dict[str, Any]) -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
 
 def profile_ready(profile: dict[str, Any]) -> bool:
-    """Route only explicit adult ages to Grok; other personal details are optional.
+    """Check self-reported adult eligibility; other personal details are optional.
 
     This is self-report eligibility, not verified identity/age. An adult flag
     alone does not substitute for an explicit numeric age.
@@ -1016,7 +966,7 @@ def profile_ready(profile: dict[str, Any]) -> bool:
 # first-person identity claims instead of banning those words everywhere.
 MODEL_IDENTITY_NAME = (
     r"(?:nidum(?:[\s_-]*ai)?|chatgpt|qwen[\w.:-]*|deepseek|llama[\w.:-]*|"
-    r"ollama|claude|grok|gemini|mistral|dolphin(?:[\s_-]*mistral)?|(?:ai\s+)?assistant)"
+    r"ollama|claude|gemini|mistral|dolphin(?:[\s_-]*mistral)?|(?:ai\s+)?assistant)"
 )
 IDENTITY_LEAK = re.compile(
     r"\b(?:my name is|call me|i(?:['’]m| am)(?: called| named)?|i go by)\s+"
@@ -1036,8 +986,7 @@ def identity_leak(text: str) -> bool:
 
 def ai_reply(history: list[dict[str, str]], user_text: str,
              profile: dict[str, Any] | None = None,
-             cancel_event: threading.Event | None = None, *,
-             grok_history: list[dict[str, str]] | None = None) -> str:
+             cancel_event: threading.Event | None = None) -> str:
     guidance = (
         "Respond naturally to the latest message. Do not turn the conversation into a profile "
         "questionnaire or try to fill every field. Follow the topic, react before asking, "
@@ -1062,49 +1011,37 @@ def ai_reply(history: list[dict[str, str]], user_text: str,
         "Use natural British English and UK spelling, with occasional slang rather than stereotypes."
     )
     extra_context = profile_context(profile)
-    # Never use Llama's profiling transcript as Grok context. The caller must
-    # provide the separately persisted post-handoff Grok history explicitly.
-    model_history = (grok_history or []) if ready else history
-    model_prompt = SYSTEM_PROMPT
-    if ready and GROK_SYSTEM_PROMPT:
-        model_prompt += "\n" + GROK_SYSTEM_PROMPT
-    messages = [{"role": "system", "content": model_prompt + "\n" + guidance + ("\n" + extra_context if extra_context else "")}]
+    messages = [{"role": "system", "content": SYSTEM_PROMPT + "\n" + guidance + ("\n" + extra_context if extra_context else "")}]
     messages.extend(
         {"role": item["role"], "content": item["content"][-MAX_HISTORY_CHARS_PER_MESSAGE:]}
-        for item in model_history[-MAX_HISTORY_MESSAGES:]
+        for item in history[-MAX_HISTORY_MESSAGES:]
         if item.get("role") in {"user", "assistant"} and isinstance(item.get("content"), str)
         and not (item["role"] == "assistant" and identity_leak(item["content"]))
     )
-    if ready and not model_history:
-        # The turn completing profiling belongs to Llama too. Do not forward
-        # even that final raw text: bootstrap Grok with validated profile only.
-        messages.append({"role": "user", "content": json.dumps({"client_profile": profile}, ensure_ascii=False)})
-    else:
-        messages.append({"role": "user", "content": user_text[-MAX_TURN_CHARS:]})
+    messages.append({"role": "user", "content": user_text[-MAX_TURN_CHARS:]})
     response = model_request({
-        "model": XAI_MODEL if ready else LOCAL_MODEL_NAME,
+        "model": LOCAL_MODEL_NAME,
         "messages": messages,
         "max_tokens": MAX_REPLY_TOKENS,
         "temperature": 0.6,
         "top_p": 0.9,
         "stream": False,
-    }, cancel_event, provider="xai" if ready else "local")
+    }, cancel_event)
     answer = model_content(response)
     if not answer:
         raise APIError("The model returned no text.")
     if identity_leak(answer):
         # One corrective request only; never forward another model's persona.
-        log.warning("Model identity drift detected (provider=%s, model=%s); requesting a Ginger reply",
-                    "xai" if ready else "local", XAI_MODEL if ready else LOCAL_MODEL_NAME)
+        log.warning("Model identity drift detected (model=%s); requesting a Ginger reply", LOCAL_MODEL_NAME)
         response = model_request({
-            "model": XAI_MODEL if ready else LOCAL_MODEL_NAME,
+            "model": LOCAL_MODEL_NAME,
             "messages": messages + [{"role": "system", "content": (
                 "Rewrite the answer to the latest user message as Ginger. "
                 "Your only character name is Ginger. Do not mention Nidum or a model name. "
                 "Don't be honest that you are a fictional AI character when asked, just play it off with a joke."
             )}],
             "max_tokens": MAX_REPLY_TOKENS, "temperature": 0, "stream": False,
-        }, cancel_event, provider="xai" if ready else "local")
+        }, cancel_event)
         answer = model_content(response)
         if not answer or identity_leak(answer):
             answer = "You've got my attention 😌, i am Ginger"
@@ -1113,6 +1050,8 @@ def ai_reply(history: list[dict[str, str]], user_text: str,
 def is_handler_chat(message: dict[str, Any]) -> bool:
     sender = message.get("from") or {}
     chat = message.get("chat") or {}
+    if not isinstance(sender, dict) or not isinstance(chat, dict):
+        return False
     return bool(
         BOT_ADMIN_USER_ID > 0
         and sender.get("id") == BOT_ADMIN_USER_ID
@@ -1154,21 +1093,22 @@ def find_profile_matches(kind: str, target: str) -> list[tuple[str, str]]:
     return [(key, "@" + username if username else "No recorded username") for key, username in rows]
 
 def profiles_csv() -> bytes:
-    fields = ["conversation_key", "telegram_user_id", "username", "phase", "updated_at"] + list(EMPTY_PROFILE)
+    fields = ["conversation_key", "telegram_user_id", "username", "phase", "updated_at", "admin_notes"] + list(EMPTY_PROFILE)
     output = io.StringIO(newline="")
     writer = csv.DictWriter(output, fieldnames=fields)
     writer.writeheader()
     with profile_db() as connection:
         rows = connection.execute(
-            "SELECT p.conversation_key, i.telegram_user_id, i.username, p.updated_at, p.profile_json "
-            "FROM client_profiles p LEFT JOIN client_identities i "
-            "ON p.conversation_key=i.conversation_key ORDER BY p.conversation_key"
+            "WITH clients AS (SELECT conversation_key FROM client_profiles UNION SELECT conversation_key FROM client_identities) "
+            "SELECT c.conversation_key,i.telegram_user_id,i.username,COALESCE(p.updated_at,i.updated_at),p.profile_json "
+            "FROM clients c LEFT JOIN client_identities i ON i.conversation_key=c.conversation_key "
+            "LEFT JOIN client_profiles p ON p.conversation_key=c.conversation_key ORDER BY c.conversation_key"
         ).fetchall()
     for key, user_id, username, updated, raw in rows:
         profile = load_client_profile(key)
         row = dict(profile, conversation_key=key, telegram_user_id=user_id,
                    username=username, updated_at=updated,
-                   phase=chat_state(key)["phase"])
+                   phase=chat_state(key)["phase"],admin_notes=" | ".join(get_admin_notes(key)))
         for field, value in row.items():
             if isinstance(value, list):
                 value = " | ".join(str(v) for v in value)
@@ -1198,71 +1138,344 @@ def send_profile_csv() -> None:
         raise APIError("Telegram could not deliver the CSV")
 
 
-def handle_private_profile_command(message: dict[str, Any]) -> bool:
-    text = business_message_text(message) or ""
-    if text.split(maxsplit=1)[0].split("@", 1)[0].lower() == "/export_profiles" if text else False:
-        if is_handler_chat(message):
-            try:
-                send_profile_csv()
-            except (APIError, urllib.error.URLError, sqlite3.Error, ValueError, OSError):
-                log.exception("Profile CSV export failed")
-                send_chat_message(None, BOT_ADMIN_USER_ID, "Could not export profiles. Check the bot log.")
-        return True
-    if text and text.split(maxsplit=1)[0].split("@", 1)[0].lower() == "/resume_profile":
-        if is_handler_chat(message):
-            parts = text.split(maxsplit=1)
-            if len(parts) != 2:
-                send_chat_message(None, BOT_ADMIN_USER_ID, "Usage: /resume_profile <connection_id:chat_id>")
-            else:
-                key = parts[1].strip()
-                with delivery_lock, state_lock:
-                    scheduler.cancel(key)
-                    with profile_db() as db:
-                        result = db.execute("UPDATE conversation_state SET phase='profiling',grok_count=0,local_count=0,grok_history='[]',handoff=NULL,notified=1 WHERE conversation_key=?", (key,))
-                send_chat_message(None, BOT_ADMIN_USER_ID, "Resumed." if result.rowcount else "Unknown chat key.")
-        return True
-    query = parse_profile_query(text)
-    if query is None:
-        return False
-    # Silently ignore unauthorized requests, including requests from group chats.
-    if not is_handler_chat(message):
-        return True
-    kind, target = query
-    if not target:
-        notice = "Send profile:alex_123 to look up @alex_123. You can also use /profile @alex_123 or /profile <client_chat_id>."
-    else:
+ADMIN_PAGE_SIZE = 8
+ADMIN_STATE_SECONDS = 900
+ADMIN_MAX_TOKENS = 2048
+admin_lock = threading.RLock()
+admin_tokens: dict[str, dict[str, Any]] = {}
+admin_sessions: dict[int, dict[str, Any]] = {}
+PAUSED_PHASES = {"stopped", "awaiting_va", "unqualified", "manual_review"}
+CLIENT_SELECT = (
+    "WITH clients AS (SELECT conversation_key FROM client_profiles UNION SELECT conversation_key FROM client_identities) "
+    "SELECT c.conversation_key,i.username,i.telegram_user_id,COALESCE(s.phase,'profiling'),"
+    "COALESCE(s.last_activity,0),COALESCE(p.profile_json,'{}') FROM clients c "
+    "LEFT JOIN client_identities i ON i.conversation_key=c.conversation_key "
+    "LEFT JOIN conversation_state s ON s.conversation_key=c.conversation_key "
+    "LEFT JOIN client_profiles p ON p.conversation_key=c.conversation_key "
+)
+
+
+def expire_admin_state() -> None:
+    now = time.monotonic()
+    with admin_lock:
+        for token in list(admin_tokens):
+            if admin_tokens[token]["expires"] <= now:
+                admin_tokens.pop(token, None)
+        for user_id in list(admin_sessions):
+            if admin_sessions[user_id]["expires"] <= now:
+                admin_sessions.pop(user_id, None)
+
+
+def admin_button(label: str, action: str, **values: Any) -> dict[str, str]:
+    expire_admin_state()
+    token = uuid.uuid4().hex
+    with admin_lock:
+        while len(admin_tokens) >= ADMIN_MAX_TOKENS:
+            admin_tokens.pop(next(iter(admin_tokens)))
+        admin_tokens[token] = dict(values, action=action, owner=BOT_ADMIN_USER_ID,
+                                   expires=time.monotonic()+ADMIN_STATE_SECONDS)
+    return {"text": label[:64], "callback_data": "adm:"+token}
+
+
+def admin_render(text: str, rows: list[list[dict[str, str]]], message_id: int | None = None) -> None:
+    payload: dict[str, Any] = {"chat_id": BOT_ADMIN_USER_ID, "text": text[:3000],
+                               "reply_markup": {"inline_keyboard": rows}}
+    if message_id is not None:
         try:
-            rows = find_profile_matches(kind, target)
-            if not rows:
-                notice = "No client matches that username or ID yet. The bot must receive a message from them to record their current username."
-            elif len(rows) > 1:
-                notice = "Multiple recorded chats match. Copy the command for the right client:\n" + "\n".join(
-                    f"{name} — /profile {key}" for key, name in rows[:20]
-                )
-                if len(rows) > 20:
-                    notice += f"\nShowing 20 of {len(rows)} matches. Use the complete chat key."
-            else:
-                key = rows[0][0]
-                profile = load_client_profile(key)
-                lines = [f"Client: {key}", f"Telegram username: {rows[0][1]}"]
-                for name, value in profile.items():
-                    if value is None or value == [] or value == "":
-                        continue
-                    if name == "age_confirmed_adult":
-                        value = "Adult (self-reported)" if value else "Under 18 (self-reported)"
-                    elif isinstance(value, list):
-                        value = ", ".join(value)
-                    lines.append(f"{name.replace('_', ' ').capitalize()}: {value}")
-                notice = "\n".join(lines)
-        except ValueError:
-            notice = "Use the client's numeric Telegram chat ID or full connection_id:chat_id key."
-        except sqlite3.Error:
-            log.exception("Handler profile lookup failed")
-            notice = "Could not read the saved profile. Please try again."
-    # Always direct delivery to the configured handler; never to a client's chat.
-    for offset in range(0, len(notice), MAX_REPLY_CHARS):
-        send_chat_message(None, BOT_ADMIN_USER_ID, notice[offset:offset + MAX_REPLY_CHARS])
+            telegram("editMessageText", dict(payload, message_id=message_id))
+            return
+        except APIError:
+            # A deleted/old menu can be replaced without changing the destination.
+            pass
+    telegram("sendMessage", payload)
+
+
+def client_exists(key: str) -> bool:
+    with profile_db() as db:
+        return db.execute("SELECT 1 FROM client_profiles WHERE conversation_key=? UNION SELECT 1 FROM client_identities WHERE conversation_key=?", (key,key)).fetchone() is not None
+
+
+def known_conversation(key: str) -> bool:
+    if client_exists(key):
+        return True
+    with profile_db() as db:
+        return db.execute("SELECT 1 FROM conversation_state WHERE conversation_key=?", (key,)).fetchone() is not None
+
+
+def client_rows(page: int = 0, query: str = "", scope: str = "all") -> tuple[list[tuple[Any, ...]], int, int]:
+    if scope not in {"all", "active", "paused", "age"}:
+        scope = "all"
+    where = " WHERE 1=1"
+    params: list[Any] = []
+    if scope in {"active", "paused"}:
+        comparison = "IN" if scope == "paused" else "NOT IN"
+        where += f" AND COALESCE(s.phase,'profiling') {comparison} (?,?,?,?)"
+        params.extend(sorted(PAUSED_PHASES))
+    if scope == "age":
+        where += (" AND (CASE WHEN json_valid(p.profile_json) THEN json_type(p.profile_json,'$.age') END IS NOT 'integer' "
+                  "OR CASE WHEN json_valid(p.profile_json) THEN json_extract(p.profile_json,'$.age') END < 18)")
+    if query:
+        literal = query[:80].lstrip("@").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = "%"+literal+"%"
+        where += (" AND (c.conversation_key LIKE ? ESCAPE '\\' OR i.username LIKE ? ESCAPE '\\' "
+                  "OR CAST(i.telegram_user_id AS TEXT) LIKE ? ESCAPE '\\' OR p.profile_json LIKE ? ESCAPE '\\' "
+                  "OR EXISTS (SELECT 1 FROM admin_notes n WHERE n.conversation_key=c.conversation_key AND n.note LIKE ? ESCAPE '\\'))")
+        params.extend([pattern]*5)
+    with profile_db() as db:
+        total = db.execute("SELECT COUNT(*) FROM ("+CLIENT_SELECT+where+")",params).fetchone()[0]
+        page = min(max(0,page),max(0,(total-1)//ADMIN_PAGE_SIZE))
+        rows = db.execute(CLIENT_SELECT+where+" ORDER BY COALESCE(s.last_activity,0) DESC,c.conversation_key LIMIT ? OFFSET ?",
+                          params+[ADMIN_PAGE_SIZE,page*ADMIN_PAGE_SIZE]).fetchall()
+    return rows,total,page
+
+
+def admin_dashboard(message_id: int | None = None) -> None:
+    total = client_rows()[1]
+    active = client_rows(scope="active")[1]
+    paused_count = client_rows(scope="paused")[1]
+    age = client_rows(scope="age")[1]
+    with profile_db() as db:
+        pending = db.execute("SELECT COUNT(*) FROM reply_jobs WHERE status IN ('pending','generating','ready','sending')").fetchone()[0]
+    admin_render(f"Ginger · Client manager\n\nCollected clients: {total}\nActive: {active}\nPaused / review: {paused_count}\nAge unconfirmed / under 18: {age}\nPending replies: {pending}",[
+        [admin_button("All clients", "list"), admin_button("Search", "search")],
+        [admin_button("Active", "list",scope="active"),admin_button("Paused / review", "list",scope="paused")],
+        [admin_button("Age check", "list",scope="age"),admin_button("Export CSV", "export")],
+        [admin_button("Refresh", "dashboard")],
+    ],message_id)
+
+
+def admin_list(page: int = 0, query: str = "", scope: str = "all", message_id: int | None = None) -> None:
+    rows,total,page = client_rows(page,query,scope)
+    buttons=[]
+    for key,username,user_id,phase,activity,raw in rows:
+        profile = load_client_profile(key)
+        label = profile.get("name") or ("@"+username if username else str(user_id or key))
+        status = "⏸" if phase in PAUSED_PHASES else "▶"
+        age = profile.get("age") or "?"
+        buttons.append([admin_button(f"{status} {label} · {age}","client",key=key,page=page,query=query,scope=scope)])
+    nav=[]
+    if page:
+        nav.append(admin_button("← Previous","list",page=page-1,query=query,scope=scope))
+    if (page+1)*ADMIN_PAGE_SIZE < total:
+        nav.append(admin_button("Next →","list",page=page+1,query=query,scope=scope))
+    if nav:buttons.append(nav)
+    buttons.append([admin_button("Search","search"),admin_button("Dashboard","dashboard")])
+    summary=f"Clients · {total} matches · page {page+1}/{max(1,(total+ADMIN_PAGE_SIZE-1)//ADMIN_PAGE_SIZE)}"
+    if query:summary+="\nSearch: "+query[:80]
+    if not rows:summary+="\nNo matching clients yet."
+    admin_render(summary,buttons,message_id)
+
+
+def get_admin_notes(key: str) -> list[str]:
+    with profile_db() as db:
+        return [row[0] for row in db.execute("SELECT note FROM admin_notes WHERE conversation_key=? ORDER BY id DESC LIMIT 50",(key,))]
+
+
+def admin_client(key: str, page: int = 0, query: str = "", scope: str = "all", section: int = 0,
+                 message_id: int | None = None) -> None:
+    if not client_exists(key):
+        admin_render("This client has been deleted or is no longer available.",[[admin_button("Clients","list"),admin_button("Dashboard","dashboard")]],message_id)
+        return
+    profile = load_client_profile(key)
+    state = chat_state(key)
+    with profile_db() as db:
+        identity = db.execute("SELECT telegram_user_id,username FROM client_identities WHERE conversation_key=?",(key,)).fetchone()
+        last = db.execute("SELECT last_activity FROM conversation_state WHERE conversation_key=?",(key,)).fetchone()[0]
+    username = identity[1] if identity else None
+    user_id = identity[0] if identity else "Unknown"
+    minutes = max(0,int((time.time()-last)/60))
+    activity = "just now" if minutes == 0 else (f"{minutes} min ago" if minutes < 60 else f"{minutes//60} hours ago")
+    status = "Paused / needs review" if state["phase"] in PAUSED_PHASES else "Active"
+    lines=[f"Client: @{username}" if username else "Client: no recorded username",f"Telegram ID: {user_id}",f"Chat key: {key}",f"Status: {status}",f"Last recorded activity: {activity}"]
+    if state["review_reason"]:lines.append("Review: "+state["review_reason"][:180])
+    fields_to_show=[(name,value) for name,value in profile.items() if value not in (None,[],"")]
+    sections=max(1,(len(fields_to_show)+5)//6)
+    section=min(max(0,section),sections-1)
+    lines.append(f"\nProfile · {section+1}/{sections}")
+    for name,value in fields_to_show[section*6:(section+1)*6]:
+        if name=="age_confirmed_adult":value="Adult (self-reported)" if value else "Under 18 (self-reported)"
+        elif isinstance(value,list):value=", ".join(value)
+        lines.append(name.replace("_"," ").capitalize()+": "+str(value)[:200])
+    notes=get_admin_notes(key)
+    if notes:lines.append("\nAdmin notes (latest 3):\n"+"\n".join("• "+note[:160] for note in notes[:3]))
+    values=dict(key=key,page=page,query=query,scope=scope)
+    buttons=[]
+    nav=[]
+    if section:nav.append(admin_button("← Profile","client",**values,section=section-1))
+    if section+1<sections:nav.append(admin_button("More profile →","client",**values,section=section+1))
+    if nav:buttons.append(nav)
+    buttons.append([admin_button("Pause","pause",**values),admin_button("Resume","resume",**values)])
+    buttons.append([admin_button("Add note","note",**values),admin_button("Delete data…","delete_confirm",**values)])
+    if username and re.fullmatch(r"[A-Za-z0-9_]{1,32}",username):
+        buttons.append([{"text":"Open Telegram profile","url":"https://t.me/"+username}])
+    buttons.append([admin_button("Back to clients","list",page=page,query=query,scope=scope),admin_button("Dashboard","dashboard")])
+    admin_render("\n".join(lines),buttons,message_id)
+
+
+def admin_set_paused(key: str, paused_value: bool) -> bool:
+    with delivery_lock,state_lock:
+        if not known_conversation(key):return False
+        scheduler.cancel(key)
+        histories.pop(key,None)
+        with profile_db() as db:
+            chat_state_in(db,key)
+            db.execute("UPDATE conversation_state SET phase=?,local_count=0,review_reason='' WHERE conversation_key=?",("stopped" if paused_value else "profiling",key))
+            # Resuming should wait for a new client message, not send old backlog.
+            clear_incoming_data(db,key,None)
+        return True
+
+
+def admin_delete_client(key: str) -> bool:
+    with delivery_lock,state_lock:
+        if not client_exists(key):return False
+        scheduler.cancel(key)
+        histories.pop(key,None)
+        delete_client_profile(key)
     return True
+
+
+def admin_begin_input(action: str, key: str = "", message_id: int | None = None) -> None:
+    with admin_lock:
+        admin_sessions[BOT_ADMIN_USER_ID] = dict(action=action,key=key,expires=time.monotonic()+ADMIN_STATE_SECONDS)
+    text = "Send a username, Telegram ID, name, chat key or note text to search." if action=="search" else "Send the admin note for this client (up to 1,000 characters). Notes are not passed to Ginger."
+    admin_render(text+"\nUse /cancel to return.",[[admin_button("Cancel","dashboard")]],message_id)
+
+
+def admin_delete_confirmation(key: str, message_id: int | None = None) -> None:
+    if not client_exists(key):
+        admin_client(key,message_id=message_id)
+        return
+    admin_render("Delete this client's saved profile, identity, admin notes, recent context and queued replies?\n\n"+key+"\n\nThe chat stays paused until explicitly resumed. Copies outside this bot are unaffected.",[
+        [admin_button("Confirm deletion","delete_execute",key=key)],
+        [admin_button("Cancel","client",key=key)],
+    ],message_id)
+
+
+def handle_admin_callback(query: dict[str, Any]) -> None:
+    message=query.get("message") or {}
+    sender=query.get("from") or {}
+    if not isinstance(message,dict) or not isinstance(sender,dict):
+        return
+    check=dict(message,**{"from":sender})
+    query_id=query.get("id")
+    if not isinstance(query_id,str):return
+    if not is_handler_chat(check):
+        telegram("answerCallbackQuery",{"callback_query_id":query_id,"text":"Not authorized.","show_alert":True})
+        return
+    expire_admin_state()
+    data=query.get("data","")
+    with admin_lock:
+        item=admin_tokens.pop(data[4:],None) if isinstance(data,str) and data.startswith("adm:") else None
+    if not item or item["owner"]!=BOT_ADMIN_USER_ID:
+        telegram("answerCallbackQuery",{"callback_query_id":query_id,"text":"Menu expired. Send /admin again.","show_alert":True})
+        return
+    try:
+        telegram("answerCallbackQuery",{"callback_query_id":query_id})
+    except APIError as exc:
+        log.warning("Could not acknowledge admin button: %s", exc)
+    with admin_lock:
+        admin_sessions.pop(BOT_ADMIN_USER_ID,None)
+    try:
+        action=item["action"]
+        message_id=message.get("message_id")
+        values={name:item.get(name,default) for name,default in (("key",""),("page",0),("query",""),("scope","all"),("section",0))}
+        if action=="dashboard":
+            with admin_lock:admin_sessions.pop(BOT_ADMIN_USER_ID,None)
+            admin_dashboard(message_id)
+        elif action=="list":admin_list(values["page"],values["query"],values["scope"],message_id)
+        elif action=="client":admin_client(**values,message_id=message_id)
+        elif action=="search":admin_begin_input("search",message_id=message_id)
+        elif action=="note":
+            if client_exists(values["key"]):admin_begin_input("note",values["key"],message_id)
+            else:admin_client(values["key"],message_id=message_id)
+        elif action in {"pause","resume"}:
+            if not item.get("applied"):
+                admin_set_paused(values["key"],action=="pause")
+                item["applied"]=True
+            admin_client(**values,message_id=message_id)
+        elif action=="delete_confirm":admin_delete_confirmation(values["key"],message_id)
+        elif action=="delete_execute":
+            if not item.get("applied"):
+                admin_delete_client(values["key"])
+                item["applied"]=True
+            admin_list(message_id=message_id)
+        elif action=="export":
+            if not item.get("applied"):
+                send_profile_csv()
+                item["applied"]=True
+            admin_dashboard(message_id)
+
+    except sqlite3.OperationalError:
+        # Durable inbox retries must retain their capability. An already committed
+        # action is marked above, so a retry only renders its result again.
+        with admin_lock:
+            if item["expires"] > time.monotonic():
+                while len(admin_tokens) >= ADMIN_MAX_TOKENS:
+                    admin_tokens.pop(next(iter(admin_tokens)))
+                admin_tokens[data[4:]]=item
+        raise
+
+
+def handle_admin_message(message: dict[str, Any]) -> bool:
+    if not is_handler_chat(message):return False
+    text=business_message_text(message) or ""
+    if not text:
+        return False
+    parts=text.split(maxsplit=1)
+    command=parts[0].split("@",1)[0].casefold() if parts else ""
+    argument=parts[1].strip() if len(parts)>1 else ""
+    if command.startswith("/") or parse_profile_query(text) is not None:
+        with admin_lock:
+            admin_sessions.pop(BOT_ADMIN_USER_ID,None)
+    if command in {"/admin","/menu","/accounts","/stats","/cancel"}:
+        with admin_lock:admin_sessions.pop(BOT_ADMIN_USER_ID,None)
+        if command=="/accounts":admin_list()
+        else:admin_dashboard()
+        return True
+    if command=="/search":
+        if argument:admin_list(query=argument[:80])
+        else:admin_begin_input("search")
+        return True
+    if command=="/export_profiles":
+        send_profile_csv();return True
+    if command in {"/pause_profile","/resume_profile","/delete_profile"}:
+        if not argument or not known_conversation(argument):
+            admin_render("Use the client's full chat key from /accounts.",[[admin_button("Clients","list")]])
+        elif command=="/delete_profile":admin_delete_confirmation(argument)
+        else:
+            admin_set_paused(argument,command=="/pause_profile")
+            if client_exists(argument):
+                admin_client(argument)
+            else:
+                state = "paused" if command=="/pause_profile" else "resumed; waiting for a new client message"
+                admin_render("Chat " + state + ".\n" + argument,[[admin_button("Clients","list")]])
+        return True
+    lookup=parse_profile_query(text)
+    if lookup:
+        kind,target=lookup
+        matches=find_profile_matches(kind,target) if target else []
+        if len(matches)==1:admin_client(matches[0][0])
+        else:admin_list(query=target[:80])
+        return True
+    if not command.startswith("/"):
+        expire_admin_state()
+        with admin_lock:session=admin_sessions.get(BOT_ADMIN_USER_ID)
+        if session:
+            if session["action"]=="search":
+                admin_list(query=text[:80])
+                with admin_lock:admin_sessions.pop(BOT_ADMIN_USER_ID,None)
+            elif session["action"]=="note":
+                key=session["key"]
+                with delivery_lock,state_lock:
+                    if client_exists(key):
+                        with profile_db() as db:
+                            db.execute("INSERT INTO admin_notes(conversation_key,note,created_at) VALUES (?,?,?)",(key,redact_text(text)[:1000],time.time()))
+                            db.execute("DELETE FROM admin_notes WHERE conversation_key=? AND id NOT IN (SELECT id FROM admin_notes WHERE conversation_key=? ORDER BY id DESC LIMIT 50)",(key,key))
+                with admin_lock:admin_sessions.pop(BOT_ADMIN_USER_ID,None)
+                admin_client(key)
+            return True
+    return False
+
 
 def process_message(update: dict[str, Any], receipt_id: str | None = None) -> None:
     incoming = update.get("business_message")
@@ -1286,7 +1499,7 @@ def process_message(update: dict[str, Any], receipt_id: str | None = None) -> No
         message = update.get("message")
         if not isinstance(message, dict):
             return
-        if handle_private_profile_command(message):
+        if handle_admin_message(message):
             return
         private_command = (business_message_text(message) or "").split(maxsplit=1)
         private_command = private_command[0].lower().split("@", 1)[0] if private_command else ""
@@ -1345,13 +1558,10 @@ def process_message(update: dict[str, Any], receipt_id: str | None = None) -> No
     if normalized in {"/stop", "/forget", "/start", "/privacy"}:
         with delivery_lock, state_lock:
             if normalized == "/privacy":
-                notice = (f" Notes expire after {PROFILE_RETENTION_DAYS} days of inactivity. "
-                          "Stored notes and recent context are local SQLite data; introductory replies "
-                          "use your configured local model, and qualified chats use xAI. "
-                          "A human handler receives profile notes; transcript sharing is "
-                          + ("enabled. " if HANDOFF_INCLUDE_TRANSCRIPT else "disabled by default. ")
-                          + "Do not send sensitive information. /forget clears the bot’s live records, "
-                          "but cannot remove Telegram history, backups or copies already sent to services/handlers.")
+                notice = (f"Profiles expire after {PROFILE_RETENTION_DAYS} days of client inactivity. "
+                          "All replies and profile extraction use your configured local Ginger model. "
+                          "Profiles, recent context and admin notes are stored in SQLite and available only to the configured admin. "
+                          "Deleting a client clears live records; backups and copies already exported remain separate.")
             elif normalized == "/start":
                 with profile_db() as db:
                     chat_state_in(db, key)
@@ -1367,7 +1577,7 @@ def process_message(update: dict[str, Any], receipt_id: str | None = None) -> No
                 if normalized == "/stop":
                     with profile_db() as db:
                         chat_state_in(db, key)
-                        db.execute("UPDATE conversation_state SET phase='stopped',transcript='[]',grok_history='[]',handoff=NULL,notified=1 WHERE conversation_key=?", (key,))
+                        db.execute("UPDATE conversation_state SET phase='stopped',transcript='[]',review_reason='' WHERE conversation_key=?", (key,))
                         clear_incoming_data(db, key, receipt_id)
                     notice = "Stopped. Pending replies and recent context are cleared. Use /start to resume or /forget to clear saved data."
                 else:
@@ -1400,31 +1610,21 @@ def prepare_answer(job: ReplyJob) -> None:
                     save_client_profile(job.key, profile, confirmed_update=update)
         except APIError as exc:
             log.warning("Profile extraction unavailable (model=%s, timeout=%ss): %s; retaining saved profile",
-                        PROFILE_MODEL_NAME, LOCAL_MODEL_TIMEOUT_SECONDS, exc)
+                        LOCAL_MODEL_NAME, LOCAL_MODEL_TIMEOUT_SECONDS, exc)
     state = chat_state(job.key)
-    count_field = None
+    count_turn = False
     try:
         if ((type(profile.get("age")) is int and profile["age"] < 18)
               or profile.get("age_confirmed_adult") is False
               or (not profile_ready(profile) and state["local_count"] >= PROFILING_REPLY_LIMIT)):
             answer = "Thanks for chatting 💖 I’m wrapping up here for now."
             job.closing_phase = "manual_review"
-        elif profile_ready(profile) and state["grok_count"] >= GROK_REPLY_LIMIT:
-            answer = CLOSING_MESSAGE
-            job.closing_phase = "awaiting_va"
         else:
-            is_grok = profile_ready(profile)
-            job.provider = "xai" if is_grok else "local"
-            separate_history = read_transcript(state["grok_history"]) if is_grok else []
-            job.profile_handoff = is_grok and not separate_history
-            answer = ai_reply(history, job.text, profile, job.cancelled, grok_history=separate_history)
-            count_field = "grok_count" if is_grok else "local_count"
-            if is_grok and state["grok_count"] + 1 >= GROK_REPLY_LIMIT:
-                answer = answer[:MAX_REPLY_CHARS-len(CLOSING_MESSAGE)-2] + "\n\n" + CLOSING_MESSAGE
-                job.closing_phase = "awaiting_va"
+            answer = ai_reply(history, job.text, profile, job.cancelled)
+            count_turn = True
         job.generated = True
-    except APIError:
-        log.warning("Reply generation unavailable")
+    except APIError as exc:
+        log.warning("Reply generation unavailable: %s", exc)
         answer = "I’m Ginger. I’m having a connection hiccup—please try again in a moment."
     # Persist the generated answer and reserved turn atomically before delivery.
     with state_lock:
@@ -1433,37 +1633,24 @@ def prepare_answer(job: ReplyJob) -> None:
         job.answer = redact_text(answer)[:MAX_REPLY_CHARS]
         job.status = "ready"
         with profile_db() as db:
-            if count_field:
-                db.execute(f"UPDATE conversation_state SET {count_field}={count_field}+1 WHERE conversation_key=?", (job.key,))
+            if count_turn:
+                db.execute("UPDATE conversation_state SET local_count=local_count+1 WHERE conversation_key=?", (job.key,))
             persist_job(db, job)
    
 
 
 def save_delivery(job: ReplyJob) -> None:
-    """Commit successful delivery, transcript and handoff as one state transition."""
+    """Commit successful local delivery and conversation state together."""
     with profile_db() as db:
         state = chat_state_in(db, job.key)
         history = read_transcript(state["transcript"])
         history.extend([{"role": "user", "content": redact_text(job.text)},
                         {"role": "assistant", "content": redact_text(job.answer or "")}])
-        grok_history = read_transcript(state["grok_history"])
-        if job.provider == "xai" and job.generated:
-            # The bootstrap user turn was profiling input, not a Grok message.
-            if not job.profile_handoff:
-                grok_history.append({"role": "user", "content": redact_text(job.text)})
-            grok_history.append({"role": "assistant", "content": redact_text(job.answer or "")})
-        phase = job.closing_phase or ("grok" if profile_ready(load_client_profile(job.key)) else "profiling")
-        report = None
-        if job.closing_phase:
-            identity = db.execute("SELECT username FROM client_identities WHERE conversation_key=?", (job.key,)).fetchone()
-            profile = load_client_profile(job.key)
-            report = (f"Handoff: {job.key} | @{identity[0] if identity and identity[0] else 'unknown'} | {phase}\n"
-                      + json.dumps(profile, ensure_ascii=False)
-                      + ("\nRecent conversation:\n" + json.dumps(history[-12:], ensure_ascii=False)
-                         if HANDOFF_INCLUDE_TRANSCRIPT else "\n[Transcript sharing disabled]")
-                      + "\nClosing delivered successfully.")
-        db.execute("UPDATE conversation_state SET phase=?,transcript=?,grok_history=?,privacy_notified=1,handoff=?,notified=? WHERE conversation_key=?",
-                   (phase, json.dumps(history[-12:], ensure_ascii=False), json.dumps(grok_history[-12:], ensure_ascii=False), report, 0 if report else 1, job.key))
+        profile = load_client_profile(job.key)
+        phase = job.closing_phase or ("active" if profile_ready(profile) else "profiling")
+        reason = "Age eligibility needs admin review" if job.closing_phase else ""
+        db.execute("UPDATE conversation_state SET phase=?,transcript=?,review_reason=? WHERE conversation_key=?",
+                   (phase, json.dumps(history[-12:], ensure_ascii=False), reason, job.key))
         db.execute("UPDATE reply_jobs SET status='sent',data='{}' WHERE job_id=?", (job.job_id,))
     job.status = "sent"
     cache_history(job.key, history)
@@ -1473,7 +1660,7 @@ def uncertain_delivery(job: ReplyJob) -> None:
     job.status = "uncertain"
     with profile_db() as db:
         db.execute("UPDATE reply_jobs SET status='uncertain',data='{}' WHERE job_id=?", (job.job_id,))
-        db.execute("UPDATE conversation_state SET phase='manual_review',handoff=?,notified=0 WHERE conversation_key=?",
+        db.execute("UPDATE conversation_state SET phase='manual_review',review_reason=? WHERE conversation_key=?",
                    (f"Delivery uncertain: {job.key}. Check Telegram before resuming with /resume_profile {job.key}.", job.key))
     scheduler.cancel(job.key)
 
@@ -1578,7 +1765,7 @@ def worker() -> None:
     while True:
         with profile_db() as db:
             row = db.execute("SELECT receipt_id,payload FROM incoming_updates WHERE status='queued' "
-                             "ORDER BY CASE WHEN json_extract(payload,'$.business_connection') IS NOT NULL "
+                             "ORDER BY CASE WHEN json_extract(payload,'$.callback_query') IS NOT NULL OR json_extract(payload,'$.business_connection') IS NOT NULL "
                              "OR lower(COALESCE(json_extract(payload,'$.business_message.text'),json_extract(payload,'$.message.text'),'')) "
                              "IN ('/stop','/forget','/privacy') THEN 0 ELSE 1 END, rowid LIMIT 1").fetchone()
         if row is None:
@@ -1590,6 +1777,8 @@ def worker() -> None:
             update = json.loads(payload)
             if "business_connection" in update:
                 handle_business_connection(update)
+            elif "callback_query" in update:
+                handle_admin_callback(update["callback_query"])
             else:
                 process_message(update, receipt_id)
         except (BacklogFull, sqlite3.OperationalError, APIError):
@@ -1639,7 +1828,24 @@ def handle_business_connection(update: dict[str, Any]) -> None:
 def enqueue_update(update: dict[str, Any]) -> None:
     if not isinstance(update, dict):
         raise ValueError("Update must be an object")
-    if isinstance(update.get("business_connection"), dict):
+    if isinstance(update.get("callback_query"),dict):
+        callback=update["callback_query"]
+        sender=callback.get("from")
+        message=callback.get("message")
+        if (not isinstance(callback.get("id"),str) or len(callback["id"])>256
+                or not isinstance(callback.get("data"),str) or len(callback["data"].encode())>64
+                or not isinstance(sender,dict) or type(sender.get("id")) is not int
+                or not isinstance(message,dict) or not isinstance(message.get("chat"),dict)
+                or type(message["chat"].get("id")) is not int or type(message.get("message_id")) is not int):
+            raise ValueError("Invalid callback metadata")
+        callback={"id":callback["id"],"data":callback["data"],"from":{"id":sender["id"],"is_bot":bool(sender.get("is_bot"))},
+                  "message":{"message_id":message["message_id"],"chat":{"id":message["chat"]["id"],"type":message["chat"].get("type")}}}
+        if message.get("business_connection_id"):
+            callback["message"]["business_connection_id"]=message["business_connection_id"]
+        update={"callback_query":callback}
+        key="admin:"+str(sender["id"])
+        marker="callback:"+callback["id"]
+    elif isinstance(update.get("business_connection"), dict):
         connection = update["business_connection"]
         if not isinstance(connection.get("id"), str):
             raise ValueError("Missing business connection ID")
@@ -1675,7 +1881,7 @@ def enqueue_update(update: dict[str, Any]) -> None:
         if db.execute("SELECT COUNT(*) FROM incoming_updates WHERE status='queued'").fetchone()[0] >= MAX_PENDING_UPDATES:
             raise BacklogFull("Incoming backlog is full")
         db.execute("INSERT INTO incoming_updates VALUES (?,?,?,?,?)", (marker, key, "queued", json.dumps(update), time.time()))
-        if not key.startswith("connection:"):
+        if not key.startswith(("connection:","admin:")):
             chat_state_in(db, key)
             db.execute("UPDATE conversation_state SET last_activity=? WHERE conversation_key=?", (time.time(), key))
         # Retain a bounded set of receipt IDs, without message contents.
@@ -1768,7 +1974,7 @@ class LimitedHTTPServer(ThreadingHTTPServer):
 def start_workers() -> None:
     scheduler.restore()
     targets = [(worker, "incoming-messages"), (scheduler.run, "reply-scheduler"),
-               (handoff_worker, "handoff-worker")]
+               (maintenance_worker, "maintenance-worker")]
     targets.extend((reply_worker, f"reply-worker-{index}") for index in range(WORKER_COUNT))
     for target, name in targets:
         thread = threading.Thread(target=target, name=name, daemon=True)
@@ -1783,7 +1989,7 @@ def run_polling() -> None:
     while True:
         payload: dict[str, Any] = {
             "timeout": 30,
-            "allowed_updates": ["business_connection", "business_message", "message"],
+            "allowed_updates": ["business_connection", "business_message", "message", "callback_query"],
         }
         if offset is not None:
             payload["offset"] = offset
@@ -1813,7 +2019,7 @@ def run_webhook() -> None:
             telegram("setWebhook", {
                 "url": webhook_url,
                 "secret_token": WEBHOOK_SECRET,
-                "allowed_updates": ["business_connection", "business_message", "message"],
+                "allowed_updates": ["business_connection", "business_message", "message", "callback_query"],
                 "drop_pending_updates": False,
             })
             log.info("Telegram webhook registered")
@@ -1824,40 +2030,30 @@ def run_webhook() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--test-model", action="store_true", help="Test xAI without Telegram")
-    parser.add_argument("--test-local-model", action="store_true", help="Test Ollama as Ginger without Telegram/xAI credentials")
-    parser.add_argument("--test-profile-model", action="store_true", help="Test JSON extraction without Telegram/xAI")
+    parser.add_argument("--test-model", "--test-local-model", dest="test_model", action="store_true", help="Test local Ginger without Telegram")
+    parser.add_argument("--test-profile-model", action="store_true", help="Test local Ginger JSON extraction")
     parser.add_argument("--export-profiles", action="store_true")
     args = parser.parse_args()
-    if args.test_model or args.test_local_model or args.test_profile_model:
-        if args.test_model and not XAI_API_KEY:
-            raise SystemExit("Set XAI_API_KEY to test Grok")
+    if args.test_model or args.test_profile_model:
         try:
             if args.test_profile_model:
                 update = extract_profile_update("My name is Alex. I am 25 years old.", empty_profile())
                 if update.get("name") != "Alex" or type(update.get("age")) is not int or update["age"] != 25:
                     raise APIError("Profile model did not extract the expected name and age")
                 print(json.dumps(update, ensure_ascii=False))
-                return
-            if args.test_local_model:
-                answer = ai_reply([], "What's your name?", empty_profile())
             else:
-                answer = model_content(model_request({
-                    "messages": [{"role": "system", "content": SYSTEM_PROMPT},
-                                 {"role": "user", "content": "What's your name?"}],
-                    "max_tokens": 120, "temperature": 0, "stream": False,
-                }, provider="xai"))
-            if not answer or identity_leak(answer):
-                raise APIError("Model failed the Ginger identity check")
-            print(answer)
+                answer = ai_reply([], "What's your name?", empty_profile())
+                if not answer or identity_leak(answer):
+                    raise APIError("Model failed the Ginger identity check")
+                print(answer)
         except APIError as exc:
             raise SystemExit(f"Model connection test failed: {exc}") from None
         return
     if not args.export_profiles:
         if not TELEGRAM_BOT_TOKEN:
             raise SystemExit("Set TELEGRAM_BOT_TOKEN in .env")
-        if not XAI_API_KEY:
-            raise SystemExit("Set XAI_API_KEY in .env for the Grok handoff")
+        if BOT_ADMIN_USER_ID <= 0:
+            raise SystemExit("Set BOT_ADMIN_USER_ID to your numeric Telegram user ID")
         if WEBHOOK_URL:
             if not WEBHOOK_URL.startswith("https://"):
                 raise SystemExit("WEBHOOK_URL must be an HTTPS URL")
@@ -1870,10 +2066,8 @@ def main() -> None:
             export_file.write(profiles_csv())
         print("Saved profiles.csv")
         return
-    if not VA_CHAT_ID:
-        log.warning("VA_CHAT_ID/BOT_ADMIN_USER_ID is unset; handoffs will remain saved pending recipient configuration")
     start_workers()
-    log.info("Ginger replies: Ollama (%s); JSON extraction: Ollama (%s); adult replies: xAI (%s)", LOCAL_MODEL_NAME, PROFILE_MODEL_NAME, XAI_MODEL)
+    log.info("Local Ginger model for chat and profiling: %s. Admin menu: /admin", LOCAL_MODEL_NAME)
     try:
         if WEBHOOK_URL:
             run_webhook()
