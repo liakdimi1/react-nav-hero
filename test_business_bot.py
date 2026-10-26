@@ -60,7 +60,7 @@ class BotTests(unittest.TestCase):
             "MAX_TYPING_SECONDS": 0, "TYPING_JITTER_SECONDS": 0,
             "POST_GENERATION_PAUSE_MIN_SECONDS": 0, "POST_GENERATION_PAUSE_MAX_SECONDS": 0,
             "REPLY_DELAY_MODE": "sequence", "REPLY_DELAY_SEQUENCE": (0, 0, 0),
-            
+
             "MAX_PENDING_JOBS": 100, "MAX_PENDING_UPDATES": 100,
         }.items()]
         for item in self.patches:
