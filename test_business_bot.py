@@ -508,5 +508,154 @@ print('HTTP worker integration passed')
         self.assertIn("HTTP worker integration passed", result.stdout)
 
 
+    def test_extraction_model_is_independent_of_ginger(self):
+        with patch.object(bot, "LOCAL_MODEL_NAME", "ginger"), patch.object(bot, "PROFILE_MODEL_NAME", "qwen2.5:3b"):
+            self.model.return_value = response('{"profile_update":{"age":25}}')
+            update = bot.extract_profile_update("I am 25", bot.empty_profile())
+            self.assertEqual(update["age"], 25)
+            self.assertEqual(self.model.call_args.args[0]["model"], "qwen2.5:3b")
+            self.assertEqual(self.model.call_args.kwargs["provider"], "local")
+            self.model.return_value = response("I'm Ginger!")
+            bot.ai_reply([], "Hello", bot.empty_profile())
+            self.assertEqual(self.model.call_args.args[0]["model"], "ginger")
+
+    def test_age_alone_allows_grok_with_personal_details_optional(self):
+        profile = bot.merge_profile_update(bot.empty_profile(), {"age": 21})
+        self.assertTrue(bot.profile_ready(profile))
+        bot.ai_reply([], "Hi", profile)
+        self.assertEqual(self.model.call_args.kwargs["provider"], "xai")
+
+    def test_adult_flag_alone_does_not_replace_numeric_age(self):
+        for age in (None, True, "21", 17, 121):
+            profile = dict(bot.empty_profile(), age=age, age_confirmed_adult=True)
+            self.assertFalse(bot.profile_ready(profile))
+        self.assertFalse(bot.profile_ready(dict(bot.empty_profile(), age=21, age_confirmed_adult=False)))
+
+    def test_unemployed_and_declined_employment_do_not_close_adult_chats(self):
+        for status in ("unemployed", "declined", "unknown"):
+            with self.subTest(status=status):
+                key = "direct-test:" + str(100 + len(status))
+                profile = dict(bot.empty_profile(), age=25, employment_status=status)
+                bot.save_client_profile(key, profile)
+                bot.chat_state(key)
+                job = bot.scheduler.add(key, None, 100, "hello")
+                bot.perform_reply(job)
+                self.assertIsNone(job.closing_phase)
+                self.assertFalse(bot.paused(key))
+                self.assertEqual(self.model.call_args.kwargs["provider"], "xai")
+
+    def test_extracted_adult_age_routes_directly_to_grok(self):
+        job = self.schedule("I am 25 years old")
+        self.model.side_effect = [response('{"profile_update":{"age":25}}'), response("I'm Ginger. Lovely to meet you!")]
+        with patch.object(bot, "PROFILE_EXTRACTION_ENABLED", True):
+            bot.perform_reply(job)
+        calls = self.model.call_args_list
+        self.assertEqual(calls[0].args[0]["model"], bot.PROFILE_MODEL_NAME)
+        self.assertEqual(calls[1].kwargs["provider"], "xai")
+        self.assertEqual(bot.chat_state(job.key)["grok_count"], 1)
+        self.assertEqual(bot.chat_state(job.key)["local_count"], 0)
+
+    def test_underage_chat_does_not_call_conversational_model(self):
+        job = self.schedule()
+        bot.save_client_profile(job.key, dict(bot.empty_profile(), age=17))
+        bot.perform_reply(job)
+        self.model.assert_not_called()
+        self.assertEqual(bot.chat_state(job.key)["phase"], "manual_review")
+
+    def test_unknown_age_keeps_sfw_guidance_and_optional_details(self):
+        bot.ai_reply([], "Hi", bot.empty_profile())
+        system = self.model.call_args.args[0]["messages"][0]["content"]
+        self.assertIn("Keep this phase SFW", system)
+        self.assertIn("Name, location, interests and employment are optional", system)
+        self.assertIn("Respect a refusal", system)
+        self.assertNotIn("Learn these details gradually:", system)
+
+    def test_same_ginger_identity_is_sent_to_both_providers(self):
+        for profile in (bot.empty_profile(), dict(bot.empty_profile(), age=25)):
+            bot.ai_reply([], "Who are you?", profile)
+            system = self.model.call_args.args[0]["messages"][0]["content"]
+            self.assertIn("Ginger", system)
+            self.assertIn("21-year-old British woman from Manchester", system)
+            self.assertIn("UK spelling", system)
+
+    def test_preferences_and_boundaries_survive_restart_and_correct(self):
+        key = "direct-test:42"
+        profile = bot.merge_profile_update(bot.empty_profile(), {"favorite_music":"techno", "boundaries":["No pet names"], "interests":["gaming"]})
+        bot.save_client_profile(key, profile)
+        corrected = bot.merge_profile_update(bot.load_client_profile(key), {"favorite_music":"R&B", "interests":{"remove":["gaming"],"add":["cooking"]}})
+        bot.save_client_profile(key, corrected)
+        bot.histories.clear()
+        loaded = bot.load_client_profile(key)
+        self.assertEqual(loaded["favorite_music"], "R&B")
+        self.assertEqual(loaded["interests"], ["cooking"])
+        bot.ai_reply([], "Hello again", loaded)
+        system = self.model.call_args.args[0]["messages"][0]["content"]
+        self.assertIn("No pet names", system)
+        self.assertIn("Respect boundaries", system)
+        self.assertIn("latest user correction takes precedence", system)
+
+    def test_old_plans_expire_without_erasing_stable_preferences(self):
+        key = "direct-test:42"
+        with patch.object(bot.time, "time", return_value=1000000):
+            bot.save_client_profile(key, dict(bot.empty_profile(), upcoming_plans=["Trip tomorrow"], favorite_music="techno"))
+        with patch.object(bot.time, "time", return_value=1000000 + bot.PLAN_MEMORY_DAYS*86400 + 1):
+            profile = bot.load_client_profile(key)
+        self.assertEqual(profile["upcoming_plans"], [])
+        self.assertEqual(profile["favorite_music"], "techno")
+
+    def test_unrelated_profile_update_does_not_refresh_a_plan(self):
+        key = "direct-test:42"
+        with patch.object(bot.time, "time", return_value=1000000):
+            bot.save_client_profile(key, dict(bot.empty_profile(), upcoming_events=["Concert on Friday"]))
+        with patch.object(bot.time, "time", return_value=1000000 + 86400):
+            updated = bot.merge_profile_update(bot.load_client_profile(key), {"name":"Alex"})
+            bot.save_client_profile(key, updated, confirmed_update={"name":"Alex"})
+        timestamp = self.rows("SELECT confirmed_at FROM profile_memory_timestamps")[0][0]
+        self.assertEqual(timestamp, 1000000)
+
+    def test_reconfirmed_plan_refreshes_only_that_plan_and_removal_clears_metadata(self):
+        key = "direct-test:42"
+        with patch.object(bot.time, "time", return_value=1000000):
+            bot.save_client_profile(key, dict(bot.empty_profile(), upcoming_plans=["Trip", "Dinner"]))
+        with patch.object(bot.time, "time", return_value=1000000+86400):
+            delta = {"upcoming_plans":{"add":["Trip"],"remove":["Dinner"]}}
+            merged = bot.merge_profile_update(bot.load_client_profile(key), delta)
+            bot.save_client_profile(key, merged, confirmed_update=delta)
+        self.assertEqual(self.rows("SELECT item,confirmed_at FROM profile_memory_timestamps"), [("trip",1000000+86400)])
+        bot.delete_client_profile(key)
+        self.assertFalse(self.rows("SELECT * FROM profile_memory_timestamps"))
+
+    def test_legacy_undated_plans_are_not_assumed_current(self):
+        key = "direct-test:42"
+        self.execute("INSERT INTO client_profiles(conversation_key,profile_json) VALUES (?,?)", (key,json.dumps({"upcoming_plans":["yesterday"],"interests":["music"]})))
+        profile = bot.load_client_profile(key)
+        self.assertEqual(profile["upcoming_plans"], [])
+        self.assertEqual(profile["interests"], ["music"])
+
+    def test_csv_excludes_expired_plans(self):
+        key = "direct-test:42"
+        bot.save_client_profile(key, dict(bot.empty_profile(), upcoming_plans=["Expired trip"]))
+        self.execute("UPDATE profile_memory_timestamps SET confirmed_at=0")
+        self.assertNotIn("Expired trip", bot.profiles_csv().decode("utf-8-sig"))
+
+    def test_profile_model_diagnostic_validates_json_semantics(self):
+        self.model.return_value = response('{"profile_update":{"name":"Alex","age":25}}')
+        with patch.object(sys,"argv",["business_bot.py","--test-profile-model"]), contextlib.redirect_stdout(io.StringIO()) as output:
+            bot.main()
+        self.assertEqual(json.loads(output.getvalue()), {"name":"Alex","age":25})
+        self.model.return_value = response("not JSON")
+        with patch.object(sys,"argv",["business_bot.py","--test-profile-model"]):
+            with self.assertRaises(SystemExit): bot.main()
+
+    def test_shorter_defaults_can_still_be_overridden(self):
+        script = 'import business_bot as b; import json; print(json.dumps([b.REPLY_DELAY_MIN_SECONDS,b.REPLY_DELAY_MAX_SECONDS,b.REPLY_DELAY_SEQUENCE]))'
+        environment = {"PATH": os.environ["PATH"]}
+        default = subprocess.run([sys.executable,"-c",script],cwd=Path(bot.__file__).parent,env=environment,capture_output=True,text=True,check=True)
+        self.assertEqual(json.loads(default.stdout),[10.0,25.0,[10.0,15.0,25.0]])
+        environment.update(REPLY_DELAY_MIN_SECONDS="60",REPLY_DELAY_MAX_SECONDS="180")
+        override = subprocess.run([sys.executable,"-c",script],cwd=Path(bot.__file__).parent,env=environment,capture_output=True,text=True,check=True)
+        self.assertEqual(json.loads(override.stdout)[:2],[60.0,180.0])
+
+
 if __name__ == "__main__":
     unittest.main()
