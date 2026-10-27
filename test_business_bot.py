@@ -55,8 +55,8 @@ class BotTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.patches = [patch.object(bot, name, value) for name, value in {
             "PROFILE_DB_PATH": str(Path(self.tmp.name) / "profiles.sqlite3"),
-            "ENABLE_DIRECT_TEST_MODE": True, "PROFILE_EXTRACTION_ENABLED": False,
-            "BOT_ADMIN_USER_ID": 99, "MIN_TYPING_SECONDS": 0,
+            "ENABLE_DIRECT_TEST_MODE": True,
+            "BOT_ADMIN_USER_ID": 99, "CHARACTER_OCCUPATION": "", "MIN_TYPING_SECONDS": 0,
             "MAX_TYPING_SECONDS": 0, "TYPING_JITTER_SECONDS": 0,
             "POST_GENERATION_PAUSE_MIN_SECONDS": 0, "POST_GENERATION_PAUSE_MAX_SECONDS": 0,
             "REPLY_DELAY_MODE": "sequence", "REPLY_DELAY_SEQUENCE": (0, 0, 0),
@@ -153,7 +153,7 @@ class BotTests(unittest.TestCase):
         answer = bot.ai_reply([], "What's your name?", bot.empty_profile())
         self.assertEqual(answer, "I'm Ginger!")
         self.assertEqual(self.model.call_count, 2)
-        self.assertIn("Your only character name is Ginger", self.model.call_args.args[0]["messages"][-1]["content"])
+        self.assertIn("Your only character name is Ginger", self.model.call_args.args[0]["messages"][0]["content"])
 
     def test_repeated_identity_leak_uses_safe_ginger_fallback(self):
         self.model.return_value = response("I'm NidumAI, your assistant.")
@@ -185,14 +185,7 @@ class BotTests(unittest.TestCase):
         self.assertFalse(p["age_confirmed_adult"])
         self.assertFalse(bot.profile_ready(p))
 
-    def test_employment_extraction_requires_matching_user_evidence(self):
-        self.model.return_value = response(json.dumps({"profile_update": {"employment_status": "employed", "employment_evidence": "I work"}}))
-        self.assertNotIn("employment_status", bot.extract_profile_update("I study", bot.empty_profile()))
-        self.assertEqual(bot.extract_profile_update("I work in a cafe", bot.empty_profile())["employment_status"], "employed")
 
-    def test_invalid_extraction_json_retains_profile(self):
-        self.model.return_value = response("not json")
-        self.assertEqual(bot.extract_profile_update("Hi", bot.empty_profile()), {})
 
     def test_batched_messages_are_durable_and_receipt_committed_atomically(self):
         job = self.schedule("one", 1)
@@ -262,17 +255,6 @@ class BotTests(unittest.TestCase):
         self.assertEqual(self.model.call_count, 1)
         self.assertEqual(bot.chat_state(job.key)["local_count"], 1)
 
-    def test_profile_extraction_cannot_recreate_forgotten_data(self):
-        job = self.schedule()
-        with patch.object(bot, "PROFILE_EXTRACTION_ENABLED", True), patch.object(bot, "extract_profile_update") as extract:
-            def forget_while_extracting(*args):
-                admin_control(message("/forget", 2))
-                return {"name": "should not be saved"}
-            extract.side_effect = forget_while_extracting
-            bot.perform_reply(job)
-        self.assertFalse(self.rows("SELECT * FROM client_profiles"))
-        self.assertFalse(self.rows("SELECT * FROM reply_jobs"))
-        self.assertEqual(self.send.call_count, 1)  # Only the /forget confirmation.
 
     def test_pending_job_and_inbox_backlog_limits(self):
         with patch.object(bot, "MAX_PENDING_UPDATES", 1):
@@ -453,7 +435,7 @@ class API(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args): pass
 with tempfile.TemporaryDirectory() as temp:
     b.PROFILE_DB_PATH = os.path.join(temp, 'state.sqlite3')
-    b.ENABLE_DIRECT_TEST_MODE = True; b.PROFILE_EXTRACTION_ENABLED = False
+    b.ENABLE_DIRECT_TEST_MODE = True
     b.REPLY_DELAY_MODE = 'sequence'; b.REPLY_DELAY_SEQUENCE = (0,)
     b.MIN_TYPING_SECONDS = b.MAX_TYPING_SECONDS = b.TYPING_JITTER_SECONDS = 0
     b.POST_GENERATION_PAUSE_MIN_SECONDS = b.POST_GENERATION_PAUSE_MAX_SECONDS = 0
@@ -571,14 +553,6 @@ print('HTTP worker integration passed')
         self.execute("UPDATE profile_memory_timestamps SET confirmed_at=0")
         self.assertNotIn("Expired trip", bot.profiles_csv().decode("utf-8-sig"))
 
-    def test_profile_model_diagnostic_validates_json_semantics(self):
-        self.model.return_value = response('{"profile_update":{"name":"Alex","age":25}}')
-        with patch.object(sys,"argv",["business_bot.py","--test-profile-model"]), contextlib.redirect_stdout(io.StringIO()) as output:
-            bot.main()
-        self.assertEqual(json.loads(output.getvalue()), {"name":"Alex","age":25})
-        self.model.return_value = response("not JSON")
-        with patch.object(sys,"argv",["business_bot.py","--test-profile-model"]):
-            with self.assertRaises(SystemExit): bot.main()
 
     def test_shorter_defaults_can_still_be_overridden(self):
         script = 'import business_bot as b; import json; print(json.dumps([b.REPLY_DELAY_MIN_SECONDS,b.REPLY_DELAY_MAX_SECONDS,b.REPLY_DELAY_SEQUENCE]))'
@@ -673,15 +647,8 @@ print('HTTP worker integration passed')
         self.assertEqual(bot.scheduler.pending["biz:42"][0].text,"Hello Ginger")
         self.send.assert_not_called()
 
-    def test_freeform_employment_matches_user_prompt_and_requires_evidence(self):
-        self.model.return_value = response('{"profile_update":{"employment_status":"part-time barista","employment_evidence":"I work part-time in a cafe"}}')
-        update = bot.extract_profile_update("I work part-time in a cafe",bot.empty_profile())
-        profile = bot.merge_profile_update(bot.empty_profile(),update)
-        self.assertEqual(profile["employment_status"],"part-time barista")
-        update = bot.extract_profile_update("I study chemistry",bot.empty_profile())
-        self.assertNotIn("employment_status",update)
 
-    def test_uploaded_prompt_source_is_unchanged(self):
+    def test_character_prompt_source_is_preserved(self):
         import ast,hashlib
         source = Path(bot.__file__).read_text()
         expected = json.loads(Path(bot.__file__).with_name("prompt_checksums.json").read_text())
@@ -711,7 +678,7 @@ print('HTTP worker integration passed')
 
     def test_identity_retry_keeps_local_conversation_context(self):
         self.model.side_effect=[response("I'm Nidum AI"),response("I'm Ginger")]
-        bot.ai_reply([{"role":"user","content":"PRIVATE_LOCAL_TURN"}],"FINAL_LOCAL_ANSWER",dict(bot.empty_profile(),age=25))
+        bot.ai_reply([{"role":"user","content":"PRIVATE_LOCAL_TURN"},{"role":"assistant","content":"Thanks for telling me."}],"FINAL_LOCAL_ANSWER",dict(bot.empty_profile(),age=25))
         for call in self.model.call_args_list:
             self.assertIn("PRIVATE_LOCAL_TURN",json.dumps(call.args[0]))
             self.assertIn("FINAL_LOCAL_ANSWER",json.dumps(call.args[0]))
@@ -761,63 +728,10 @@ print('HTTP worker integration passed')
         self.assertIn("n_prompt_tokens=2800",str(caught.exception))
         self.assertNotIn("PRIVATE_CHAT_TEXT",str(caught.exception))
 
-    def test_profile_context_retry_keeps_current_profile_input_and_prompt(self):
-        snapshots=[]
-        def model(payload,*args,**kwargs):
-            snapshots.append(json.loads(json.dumps(payload)))
-            if len(snapshots)==1:
-                raise bot.APIError("context exceeded",context_exceeded=True)
-            return response('{"profile_update":{"age":25}}')
-        self.model.side_effect=model
-        profile=dict(bot.empty_profile(),name="Alex")
-        update=bot.extract_profile_update("I am 25",profile,[{"role":"assistant","content":"How old are you?"}])
-        self.assertEqual(update["age"],25)
-        self.assertEqual(len(snapshots),2)
-        first=json.loads(snapshots[0]["messages"][1]["content"])
-        second=json.loads(snapshots[1]["messages"][1]["content"])
-        self.assertEqual(second["recent_dialogue_for_context"],[])
-        self.assertTrue(first["recent_dialogue_for_context"])
-        self.assertEqual(first["current_profile"],second["current_profile"])
-        self.assertEqual(first["latest_user_answer"],second["latest_user_answer"])
-        self.assertEqual(snapshots[0]["messages"][0],snapshots[1]["messages"][0])
 
-    def test_profile_retry_is_bounded_and_not_used_for_connection_failures(self):
-        self.model.side_effect=bot.APIError("context exceeded",context_exceeded=True)
-        with self.assertRaises(bot.APIError):
-            bot.extract_profile_update("Hi",bot.empty_profile(),[{"role":"user","content":"old"}])
-        self.assertEqual(self.model.call_count,2)
-        self.model.reset_mock();self.model.side_effect=bot.APIError("Connection refused")
-        with self.assertRaises(bot.APIError):
-            bot.extract_profile_update("Hi",bot.empty_profile(),[{"role":"user","content":"old"}])
-        self.assertEqual(self.model.call_count,1)
 
-    def test_context_overflow_without_old_dialogue_is_not_retried(self):
-        self.model.side_effect=bot.APIError("context exceeded",context_exceeded=True)
-        with self.assertRaises(bot.APIError):bot.extract_profile_update("Hi",bot.empty_profile())
-        self.assertEqual(self.model.call_count,1)
 
-    def test_profile_request_bounds_previous_messages_only(self):
-        self.model.return_value=response('{"profile_update":{}}')
-        history=[{"role":"assistant","content":"A"*5000} for _ in range(8)]
-        latest="B"*9000
-        profile=dict(bot.empty_profile(),interests=["music"])
-        bot.extract_profile_update(latest,profile,history)
-        data=json.loads(self.model.call_args.args[0]["messages"][1]["content"])
-        self.assertEqual(len(data["recent_dialogue_for_context"]),6)
-        self.assertTrue(all(len(message["content"])==bot.MAX_HISTORY_CHARS_PER_MESSAGE for message in data["recent_dialogue_for_context"]))
-        self.assertEqual(data["latest_user_answer"],latest)
-        self.assertEqual(data["current_profile"],profile)
 
-    def test_profile_failure_log_reports_cause_and_retains_profile(self):
-        job=self.schedule("PRIVATE_CLIENT_MESSAGE")
-        bot.save_client_profile(job.key,dict(bot.empty_profile(),name="Alex"))
-        with patch.object(bot,"PROFILE_EXTRACTION_ENABLED",True),patch.object(bot,"extract_profile_update",side_effect=bot.APIError("Upstream HTTP 404: requested model is unavailable")):
-            with self.assertLogs(bot.log,level="WARNING") as logs:bot.prepare_answer(job)
-        output="\n".join(logs.output)
-        self.assertIn("HTTP 404",output)
-        self.assertIn("model="+bot.LOCAL_MODEL_NAME,output)
-        self.assertNotIn("PRIVATE_CLIENT_MESSAGE",output)
-        self.assertEqual(bot.load_client_profile(job.key)["name"],"Alex")
 
     def test_connection_refusal_and_timeout_have_actionable_safe_errors(self):
         import urllib.error
@@ -870,11 +784,7 @@ print('HTTP worker integration passed')
         self.assertEqual(http.call_args.args[1]["model"],bot.LOCAL_MODEL_NAME)
         self.assertFalse(hasattr(bot,"PROFILE_MODEL_NAME"))
 
-    def test_same_ginger_model_is_used_for_chat_and_profile_extraction(self):
-        self.model.return_value=response('{"profile_update":{"age":25}}')
-        bot.extract_profile_update("I am 25",bot.empty_profile())
-        self.assertEqual(self.model.call_args.args[0]["model"],bot.LOCAL_MODEL_NAME)
-        self.assertNotIn("provider",self.model.call_args.kwargs)
+    def test_same_ginger_model_is_used_for_chat_at_all_stages(self):
         self.model.return_value=response("I'm Ginger")
         for profile in (bot.empty_profile(),dict(bot.empty_profile(),age=25)):
             bot.ai_reply([],"Hello",profile)
@@ -1175,7 +1085,7 @@ def client(text,number):
     b.enqueue_update({'message':{'message_id':number,'chat':{'id':42,'type':'private'},'from':{'id':42,'username':'alex'},'text':text}})
 with tempfile.TemporaryDirectory() as tmp:
     b.PROFILE_DB_PATH=os.path.join(tmp,'state.sqlite3');b.BOT_ADMIN_USER_ID=99
-    b.ENABLE_DIRECT_TEST_MODE=True;b.PROFILE_EXTRACTION_ENABLED=True
+    b.ENABLE_DIRECT_TEST_MODE=True
     b.REPLY_DELAY_MODE='sequence';b.REPLY_DELAY_SEQUENCE=(0,)
     b.MIN_TYPING_SECONDS=b.MAX_TYPING_SECONDS=b.TYPING_JITTER_SECONDS=0
     b.POST_GENERATION_PAUSE_MIN_SECONDS=b.POST_GENERATION_PAUSE_MAX_SECONDS=0
@@ -1184,13 +1094,18 @@ with tempfile.TemporaryDirectory() as tmp:
     base='http://127.0.0.1:'+str(api.server_port)
     b.TELEGRAM_API=base+'/botTEST';b.LOCAL_CHAT_COMPLETIONS_API=base+'/v1/chat/completions'
     b.initialize_storage();b.start_workers();client('I am Alex and I am 25',1)
-    wait_for(lambda:b.chat_state('direct-test:42')['phase']=='active')
+    wait_for(lambda:b.chat_state('direct-test:42')['local_count']==1)
     b.enqueue_update({'message':{'message_id':11,'chat':{'id':99,'type':'private'},'from':{'id':99},'text':'/admin'}})
     dashboard=wait_for(lambda:latest_menu('Ginger · Client manager'))
     cb(button(dashboard,'All clients'),1)
     listing=wait_for(lambda:latest_menu('Clients ·'))
     cb(listing['reply_markup']['inline_keyboard'][0][0]['callback_data'],2)
     detail=wait_for(lambda:latest_menu('Client:'))
+    cb(button(detail,'Set reported age'),22)
+    wait_for(lambda:b.admin_sessions.get(99,{}).get('action')=='age')
+    b.enqueue_update({'message':{'message_id':12,'chat':{'id':99,'type':'private'},'from':{'id':99},'text':'25'}})
+    wait_for(lambda:b.load_client_profile('direct-test:42')['age']==25)
+    detail=wait_for(lambda:latest_menu('Client:') if 'Age: 25' in (latest_menu('Client:') or {}).get('text','') else None)
     cb(button(detail,'Pause'),3)
     wait_for(lambda:b.paused('direct-test:42'))
     wait_for(lambda:'Paused / needs review' in (latest_menu('Client:') or {}).get('text',''))
@@ -1201,7 +1116,7 @@ with tempfile.TemporaryDirectory() as tmp:
     client('Hello again',2)
     wait_for(lambda:len([p for path,p in API.calls if path.endswith('/sendMessage') and p.get('chat_id')==42])==2)
     assert API.models and set(API.models)=={b.LOCAL_MODEL_NAME},API.models
-    assert len(API.models)==4,API.models
+    assert len(API.models)==2,API.models
     assert all(thread.is_alive() for thread in b.runtime_threads)
     b.scheduler.shutdown();api.shutdown();api.server_close()
 print('Local-only profile/chat and admin callback integration passed')
@@ -1269,6 +1184,249 @@ print('Local-only profile/chat and admin callback integration passed')
             self.callback(data)
             self.assertEqual(resume.call_count,1)
         self.assertTrue(self.rows("SELECT 1 FROM incoming_updates WHERE conversation_key=? AND status='queued'",(key,)))
+
+
+    def test_screenshot_punctuation_loop_is_rejected_and_rewritten(self):
+        self.model.side_effect=[response('/'*160),response("That’s sweet of you 😌 How has your day been?")]
+        answer=bot.ai_reply([],"Your lovely smile",dict(bot.empty_profile(),name="Dimi",age=25))
+        self.assertNotIn('/'*20,answer)
+        self.assertEqual(self.model.call_count,2)
+        self.assertIn("meaningful words",self.model.call_args.args[0]["messages"][0]["content"])
+
+    def test_repeated_invalid_output_uses_clean_fallback(self):
+        self.model.return_value=response('/'*160)
+        answer=bot.ai_reply([],"Hello",bot.empty_profile())
+        self.assertIsNone(bot.reply_problem(answer,bot.empty_profile()))
+        self.assertEqual(self.model.call_count,2)
+
+    def test_normal_urls_emojis_and_markdown_are_not_repetition(self):
+        for text in ("https://example.com/path/to/music", "Aww 😌💕", "I like R&B / techno.", "**That sounds lovely!**", "Yes! "*3):
+            with self.subTest(text=text):self.assertFalse(bot.repeated_output(text))
+        self.assertTrue(bot.repeated_output("yes "*30))
+
+    def test_screenshot_wrong_vocative_is_corrected_without_blocking_self_intro(self):
+        profile=dict(bot.empty_profile(),name="Dimi",age=25)
+        bad="okay so ginger, what keeps you busy over there?"
+        self.assertEqual(bot.reply_problem(bad,profile),"role_confusion")
+        for text in ("I'm Ginger, lovely to meet you!","You can call me Ginger.","Ginger is a spice."):
+            self.assertIsNone(bot.reply_problem(text,profile))
+        self.model.side_effect=[response(bad),response("Dimi, what music do you enjoy playing?")]
+        answer=bot.ai_reply([],"I'm a musician",profile)
+        self.assertNotIn("so ginger",answer.lower())
+        self.assertIn('"client_name": "Dimi"',self.model.call_args.args[0]["messages"][0]["content"])
+
+    def test_clients_who_explicitly_share_the_name_ginger_are_allowed(self):
+        self.assertTrue(bot.client_explicitly_named_ginger("My name is Ginger"))
+        self.assertFalse(bot.client_explicitly_named_ginger("Hi Ginger"))
+        self.assertTrue(bot.client_explicitly_named_ginger("Ginger",[{"role":"assistant","content":"What's your name?"}]))
+        self.assertFalse(bot.client_explicitly_named_ginger("Ginger",[{"role":"assistant","content":"How are you?"}]))
+        self.model.return_value=response("Hi Ginger, lovely to meet you!")
+        bot.ai_reply([],"My name is Ginger",dict(bot.empty_profile(),name="Ginger",age=25))
+        self.assertEqual(self.model.call_count,1)
+
+    def test_screenshot_freelance_writer_job_is_not_invented(self):
+        bad="ohh hello dimi, lovely to meet you! i'm a freelance writer by day and a bit of a night owl when it comes to music 😌"
+        profile=dict(bot.empty_profile(),name="Dimi",age=25)
+        self.assertEqual(bot.reply_problem(bad,profile),"unsupported_occupation")
+        self.model.side_effect=[response(bad),response("Music is more my thing 😌 What do you enjoy?")]
+        answer=bot.ai_reply([],"What do you do for work?",profile)
+        self.assertNotIn("freelance writer",answer)
+        self.assertEqual(self.model.call_count,2)
+
+    def test_explicitly_configured_character_job_is_allowed(self):
+        with patch.object(bot,"CHARACTER_OCCUPATION","freelance writer"):
+            self.assertIsNone(bot.reply_problem("I'm a freelance writer by day.",bot.empty_profile()))
+            self.assertEqual(bot.reply_problem("I'm a nurse.",bot.empty_profile()),"unsupported_occupation")
+            self.assertIn('"character_occupation": "freelance writer"',bot.character_boundaries(bot.empty_profile(),False))
+
+    def test_client_occupation_does_not_become_gingers_job(self):
+        profile=dict(bot.empty_profile(),age=25,occupation="musician")
+        self.assertIsNone(bot.reply_problem("You're a musician? How did you get into that?",profile))
+        self.assertEqual(bot.reply_problem("I'm a musician too!",profile),"unsupported_occupation")
+        self.assertIn("client profile describes the client, never you",bot.character_boundaries(profile,False))
+
+
+    def test_ambiguous_saved_ginger_name_is_omitted_from_model_context_only(self):
+        profile=dict(bot.empty_profile(),name="Ginger",age=25,interests=["music"])
+        bot.ai_reply([],"Hi",profile)
+        system=self.model.call_args.args[0]["messages"][0]["content"]
+        self.assertNotIn('"name": "Ginger"',system)
+        self.assertIn('"client_name": null',system)
+        self.assertEqual(profile["name"],"Ginger")
+        self.assertIn("music",system)
+
+    def test_bad_saved_turns_are_not_fed_back_and_roles_remain_alternating(self):
+        history=[{"role":"user","content":"What do you do?"},{"role":"assistant","content":"I'm a freelance writer by day."},
+                 {"role":"user","content":"Hello"},{"role":"assistant","content":"/"*160},
+                 {"role":"user","content":"I enjoy music"},{"role":"assistant","content":"What kind of music?"}]
+        bot.ai_reply(history,"Techno",dict(bot.empty_profile(),age=25,name="Dimi"))
+        payload=self.model.call_args.args[0]
+        encoded=json.dumps(payload)
+        self.assertNotIn("freelance writer by day",encoded)
+        self.assertNotIn('/'*20,encoded)
+        self.assertIn("What kind of music?",encoded)
+        self.assertEqual([message["role"] for message in payload["messages"]],["system","user","assistant","user"])
+
+    def test_retry_uses_one_leading_system_message_for_strict_chat_templates(self):
+        self.model.side_effect=[response('/'*160),response("Hi there!")]
+        bot.ai_reply([],"Hello",bot.empty_profile())
+        messages=self.model.call_args.args[0]["messages"]
+        self.assertEqual([item["role"] for item in messages],["system","user"])
+        self.assertEqual(messages[-1]["content"],"Hello")
+        self.assertEqual(self.model.call_args.args[0]["frequency_penalty"],bot.CHAT_FREQUENCY_PENALTY)
+
+    def test_prompt_markers_and_multiple_generated_speakers_are_rejected(self):
+        for text in ("<|im_start|>assistant Hello","[INST]Hello[/INST]","User: Hello\nAssistant: Hi!"):
+            self.assertIn(bot.reply_problem(text,bot.empty_profile()),{"template_tokens","multiple_speakers"})
+
+    def test_old_ready_garbage_is_repaired_without_charging_another_turn(self):
+        job=self.schedule();bot.prepare_answer(job)
+        count=bot.chat_state(job.key)["local_count"]
+        job.answer='/'*160
+        with bot.profile_db() as db:bot.persist_job(db,job)
+        bot.scheduler=bot.ReplyScheduler();bot.scheduler.restore()
+        recovered=bot.scheduler.pending[job.key][0]
+        self.model.return_value=response("Hi, lovely to chat with you.")
+        bot.perform_reply(recovered)
+        self.assertEqual(bot.chat_state(job.key)["local_count"],count)
+        self.assertNotIn('/'*20,self.send.call_args.args[2])
+        self.assertNotIn('/'*20,bot.chat_state(job.key)["transcript"])
+
+    def test_only_accepted_reply_is_saved_to_conversation(self):
+        job=self.schedule()
+        self.model.side_effect=[response('/'*160),response("Hi there!")]
+        bot.perform_reply(job)
+        transcript=bot.chat_state(job.key)["transcript"]
+        self.assertNotIn('/'*20,transcript)
+        self.assertIn("Hi there!",transcript)
+
+
+    def test_normal_chat_has_one_generation_and_no_automatic_profile_write(self):
+        job=self.schedule("My name is Alex and I am 25")
+        bot.perform_reply(job)
+        self.assertEqual(self.model.call_count,1)
+        self.assertFalse(self.rows("SELECT * FROM client_profiles"))
+        self.assertTrue(self.rows("SELECT * FROM client_identities"))
+        self.assertIn("My name is Alex",bot.chat_state(job.key)["transcript"])
+
+    def test_existing_saved_details_remain_unchanged_during_chat(self):
+        job=self.schedule("Actually I'm 30 and my favourite music changed")
+        bot.save_client_profile(job.key,dict(bot.empty_profile(),name="Alex",age=25,favorite_music="techno"))
+        before=bot.load_client_profile(job.key)
+        bot.perform_reply(job)
+        self.assertEqual(bot.load_client_profile(job.key),before)
+        self.assertEqual(self.model.call_count,1)
+
+    def test_profile_extraction_function_settings_and_cli_are_removed(self):
+        for name in ("extract_profile_update","PROFILE_EXTRACTION_ENABLED","PROFILING_REPLY_LIMIT"):
+            self.assertFalse(hasattr(bot,name))
+        with patch.object(sys,"argv",["business_bot.py","--test-profile-model"]),contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as error:bot.main()
+        self.assertEqual(error.exception.code,2)
+
+    def test_unknown_age_chat_has_no_automatic_profiling_reply_limit(self):
+        job=self.schedule()
+        self.execute("UPDATE conversation_state SET local_count=99 WHERE conversation_key=?",(job.key,))
+        bot.perform_reply(job)
+        self.assertFalse(bot.paused(job.key))
+        self.assertIsNone(job.closing_phase)
+        self.assertEqual(bot.chat_state(job.key)["local_count"],100)
+        self.assertEqual(self.model.call_count,1)
+
+    def test_admin_can_record_reported_age_without_any_model_call(self):
+        first=self.seed_client(42,age=None);second=self.seed_client(43,age=None)
+        self.callback(bot.admin_button("Age","age",key=first)["callback_data"])
+        bot.process_message(message("25",chat_id=99))
+        self.assertEqual(bot.load_client_profile(first)["age"],25)
+        self.assertTrue(bot.load_client_profile(first)["age_confirmed_adult"])
+        self.assertIsNone(bot.load_client_profile(second)["age"])
+        self.model.assert_not_called()
+
+    def test_invalid_manual_age_is_rejected_and_clear_removes_it(self):
+        key=self.seed_client()
+        self.callback(bot.admin_button("Age","age",key=key)["callback_data"])
+        bot.process_message(message("400",chat_id=99))
+        self.assertEqual(bot.load_client_profile(key)["age"],25)
+        self.assertIn(99,bot.admin_sessions)
+        bot.process_message(message("clear",2,chat_id=99))
+        self.assertIsNone(bot.load_client_profile(key)["age"])
+        self.assertIsNone(bot.load_client_profile(key)["age_confirmed_adult"])
+        self.model.assert_not_called()
+
+    def test_no_intake_question_instructions_are_added_to_chat(self):
+        bot.ai_reply([],"Hello",bot.empty_profile())
+        text=self.model.call_args.args[0]["messages"][0]["content"]
+        self.assertNotIn("ask once naturally for their age",text)
+        self.assertIn("Do not start a profiling questionnaire",text)
+        self.assertIn("Keep this phase SFW",text)
+
+
+    def test_manual_underage_update_cancels_old_prepared_reply_immediately(self):
+        job=self.schedule()
+        bot.save_client_profile(job.key,dict(bot.empty_profile(),age=25))
+        bot.prepare_answer(job)
+        self.assertIsNotNone(job.answer)
+        bot.admin_set_reported_age(job.key,{"age":17})
+        self.assertTrue(job.cancelled.is_set())
+        self.assertEqual(bot.chat_state(job.key)["phase"],"manual_review")
+        self.assertEqual(bot.chat_state(job.key)["transcript"],"[]")
+        bot.perform_reply(job)
+        self.send.assert_not_called()
+
+    def test_clearing_age_cancels_old_context_but_keeps_future_chat_available_sfw(self):
+        job=self.schedule()
+        bot.save_client_profile(job.key,dict(bot.empty_profile(),age=25))
+        bot.prepare_answer(job)
+        bot.admin_set_reported_age(job.key,{"age":None,"age_confirmed_adult":None})
+        self.assertTrue(job.cancelled.is_set())
+        self.assertFalse(bot.paused(job.key))
+        self.assertEqual(bot.chat_state(job.key)["transcript"],"[]")
+        bot.perform_reply(job)
+        self.send.assert_not_called()
+
+    def test_adult_age_update_does_not_automatically_resume_a_paused_chat(self):
+        key=self.seed_client(42,age=17)
+        self.execute("UPDATE conversation_state SET phase='manual_review',review_reason='Reported age is under 18' WHERE conversation_key=?",(key,))
+        bot.admin_set_reported_age(key,{"age":25})
+        self.assertTrue(bot.paused(key))
+        self.assertTrue(bot.profile_ready(bot.load_client_profile(key)))
+        self.assertIn("Age updated",bot.chat_state(key)["review_reason"])
+
+    def test_self_introductions_and_occupation_idioms_remain_valid(self):
+        for text in ("Hi! Ginger here.","Hey, Ginger here!","Hello, Ginger speaking.","I'm a model citizen, most days.","I'm a student of life."):
+            with self.subTest(text=text):self.assertIsNone(bot.reply_problem(text,bot.empty_profile()))
+        self.assertEqual(bot.reply_problem("Hi Ginger, here is a question.",bot.empty_profile()),"role_confusion")
+
+    def test_meaningful_formatted_text_with_separator_is_not_a_punctuation_loop(self):
+        text="Here is the short divider you asked for:\n----------------------\nWe can carry on chatting now."
+        self.assertFalse(bot.repeated_output(text))
+        self.assertTrue(bot.repeated_output('/'*160))
+
+
+    def test_retained_ready_reply_cannot_bypass_an_existing_underage_record(self):
+        job=self.schedule()
+        bot.save_client_profile(job.key,dict(bot.empty_profile(),age=17))
+        job.answer="An old prepared answer";job.status="ready";job.generated=True
+        with bot.profile_db() as db:bot.persist_job(db,job)
+        bot.perform_reply(job)
+        self.send.assert_not_called()
+        self.model.assert_not_called()
+        self.assertEqual(bot.chat_state(job.key)["phase"],"manual_review")
+        self.assertEqual(self.rows("SELECT status FROM reply_jobs WHERE job_id=?",(job.job_id,)),[("cancelled",)])
+
+    def test_old_unknown_age_quota_closing_is_regenerated_without_pausing(self):
+        job=self.schedule()
+        job.answer="Thanks for chatting 💖 I’m wrapping up here for now."
+        job.closing_phase="manual_review";job.generated=True;job.status="ready"
+        with bot.profile_db() as db:bot.persist_job(db,job)
+        bot.scheduler=bot.ReplyScheduler();bot.scheduler.restore()
+        recovered=bot.scheduler.pending[job.key][0]
+        self.assertIsNone(recovered.answer)
+        self.assertIsNone(recovered.closing_phase)
+        bot.perform_reply(recovered)
+        self.assertFalse(bot.paused(job.key))
+        self.assertNotIn("wrapping up",self.send.call_args.args[2])
+        self.assertEqual(self.model.call_count,1)
 
 
 if __name__ == "__main__":

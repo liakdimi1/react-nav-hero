@@ -1,90 +1,116 @@
-# Local Ginger Telegram Business bot
+# Local Ginger chat bot and private admin client manager
 
-One local **Ginger** model handles every chat reply and profile extraction.
-The same OpenAI-compatible local endpoint and model alias are used for both
-jobs. Python 3.10+ standard library only; no pip dependencies.
+Ginger handles chat replies through one local OpenAI-compatible model server.
+**Automatic profile extraction is removed:** there is no second JSON extraction
+request, no automatic personal-fact update, no extraction prompt/setting/CLI, and
+no profiling reply quota. A normal reply uses one generation. Invalid output can
+receive one bounded rewrite before a clean fallback is used.
 
-The private Telegram admin menu manages collected client profiles and observed
-Telegram identities. Existing personality and extraction prompt text is retained
-from the supplied Python file. Admin notes are kept separate from model input.
+Collected Telegram user IDs/usernames, local conversation context, admin notes,
+manual reported ages and existing saved details remain available in the private
+admin menu. Existing details are not automatically updated from client messages.
+All generation uses the configured local model. Python 3.10+ standard library
+only; no pip dependencies or cloud-model key.
 
-## Upgrade an existing bot
+## Upgrade
 
-1. Stop the old Python bot. Keep the local model server running.
-2. Keep your `.env`, SQLite database (including any WAL files), and your own
-   `system_prompt.txt` / `Modelfile`. Replace `business_bot.py` with this version.
-3. Update `.env` with the local settings below. Old cloud-model credentials,
-   provider prompt files, separate profile-model settings and reply-limit settings
-   are unused and can be removed. The old provider prompt file is not shipped.
-4. On the first schema upgrade, the bot creates a SQLite backup beside the
-   original database named `*.pre-local-menu-*.sqlite3`. Migration retains profiles,
-   identities, supported conversation state and context. Retired conversation
-   columns are removed from the live table. Backups retain the original data.
-5. Prepared replies produced by a removed provider are cancelled rather than
-   delivered. Local prepared replies can recover without regenerating. Replies
-   interrupted during sending are marked for review to avoid duplicates.
-6. Run the local model tests, then start the bot. Send `/admin` privately to it.
+1. Stop the old Python process and preserve your `.env`, SQLite database and your
+   own prompt files. Keep the model server running.
+2. Replace `business_bot.py`. Do not overwrite existing credentials with example
+   placeholders. Old extraction/provider settings are unused and can be removed.
+3. Keep these local settings:
 
-```dotenv
-TELEGRAM_BOT_TOKEN=your_existing_bot_token
-BOT_ADMIN_USER_ID=your_numeric_telegram_user_id
-LOCAL_MODEL_BASE_URL=http://127.0.0.1:8080/v1
-LOCAL_MODEL_NAME=ginger
-LOCAL_MODEL_TIMEOUT_SECONDS=600
-```
+   ```dotenv
+   TELEGRAM_BOT_TOKEN=your_existing_bot_token
+   BOT_ADMIN_USER_ID=your_numeric_telegram_user_id
+   LOCAL_MODEL_BASE_URL=http://127.0.0.1:8080/v1
+   LOCAL_MODEL_NAME=ginger
+   LOCAL_MODEL_TIMEOUT_SECONDS=600
+   ```
 
-`BOT_ADMIN_USER_ID` must be a positive numeric **user** ID. Your private Telegram
-chat with the bot must use that same account. This ID is not your bot ID or a
-group chat ID. CLI model tests and local CSV export do not require bot credentials.
+4. Test and start from the bot folder:
 
-## Start on Windows
+   ```powershell
+   python business_bot.py --test-model
+   python business_bot.py
+   ```
 
-Keep your existing llama.cpp server running on port 8080 with `--alias ginger`.
-For a 4 GB GPU, a 3B Q4 model generally fits better than a 7B model with CPU
-offloading. The local API must expose `/v1/chat/completions`.
+`--test-local-model` is an alias for `--test-model`. The old extraction diagnostic
+flag is removed. Live startup requires the Telegram token and a positive numeric
+admin **user** ID. Model tests and local CSV export do not require Telegram
+credentials. Run one bot process per database.
 
-From the bot folder in PowerShell:
+Keep your existing llama.cpp server using `--alias ginger --port 8080`. The GGUF
+file selects the underlying model; the alias does not define its personality.
+The model's embedded chat template must match its training. A custom filename
+alone is not evidence that ChatML or another template should be forced. An Ollama
+endpoint also works with base URL `http://127.0.0.1:11434/v1` and model `ginger`.
+The optional `Modelfile` is for Ollama only.
 
-```powershell
-python business_bot.py --test-model
-python business_bot.py --test-profile-model
-python business_bot.py
-```
+## Reply-quality controls
 
-`--test-local-model` is an alias for `--test-model`. Both use Ginger locally.
-The profile test uses the synthetic name Alex and age 25. A successful result is
-JSON containing those values. Profile extraction retains the supplied 400-token
-output setting. Chat and profiling remain separate calls to the same local model.
+The changes address the observed invented writing job, reversed speaker name and
+repeated slash replies:
 
-An Ollama endpoint also works: set the base URL to `http://127.0.0.1:11434/v1`
-and load your model as `ginger`. The optional `Modelfile` is for Ollama only;
-llama.cpp uses the Python/file character prompts instead.
+- Separate character and client facts are added to the model context. Ginger is
+  the speaker. Client facts describe the client, not Ginger.
+- No occupation is supplied by default. Set `CHARACTER_OCCUPATION` only if that
+  specific job belongs in your script. Common first-person job claims outside
+  that setting are rejected. This is a pattern check, not a complete semantic
+  fact verifier.
+- Clear vocatives addressing the client as Ginger are rejected unless the client
+  explicitly introduced themselves with that name. Self-introductions as Ginger
+  remain allowed. An ambiguous old saved client name of Ginger is omitted from
+  model context without deleting the saved record or other details.
+- Long punctuation runs, repeated-word loops, template-token leakage and multiple
+  generated speaker turns are rejected. Short emoji, ordinary URLs and normal
+  slash/Markdown usage are accepted.
+- Bad historical assistant turns and their paired user turns are excluded from
+  future model context. Complete alternating exchanges are retained, avoiding
+  orphan turns that strict chat templates can reject.
+- A bad reply gets at most one rewrite. The rewrite uses one leading system
+  message instead of appending a system role after the user message. Rejected
+  output is not sent or stored as the assistant's reply.
+- Old prepared replies from earlier versions are checked and repaired before
+  delivery, without charging a second turn.
+- `CHAT_FREQUENCY_PENALTY` defaults to `0.25` (range -2 to 2) for chat requests.
+  The style/character prompt text remains; an added grounding layer provides
+  factual boundaries. The old automatic intake-question rule is removed.
 
-Enable reply access in Telegram Business and test from another Telegram account.
-`ENABLE_DIRECT_TEST_MODE=true` additionally allows private direct bot chats to be
-processed. It is off by default. Run one bot process per SQLite database.
+These controls prevent the tested output patterns. They do not establish the raw
+model's conversational quality; test your installed GGUF and its chat template.
 
 ## Admin menu
 
-Send **`/admin`** privately to the bot. The menu provides:
+Send **`/admin`** privately to the bot from the configured admin account.
 
-- Dashboard with client, active, paused/review, age-check and pending-reply counts.
-- Paginated client lists and filters, with eight clients per page.
-- Search by username, numeric ID, name, full chat key, profile contents or notes.
-- Profile details split into pages, including self-reported age and review reason.
-- Open Telegram profile links when a valid observed username is available.
-- Pause and resume per client. These cancel pending replies and wait for a new
-  client message after resume; no greeting is sent to that client.
-- Admin notes, up to 1,000 characters each and 50 notes per client. Notes are
-  searchable and included in exports, and are never sent to the model.
-- Delete confirmation before clearing live profile, identity, notes, context and
-  pending replies. The chat remains paused. Backups/exported copies are retained.
-- CSV export to the configured admin's private chat.
+The menu supports dashboard counts, paginated client lists, name/username/ID/note
+search, saved-detail pages, Open Telegram profile links, notes, manual reported
+age, pause/resume, confirmed deletion and CSV export. Every command and button
+checks both the configured admin ID and its private chat ID. Other users' commands
+are silently ignored. Normal client messages still receive replies.
 
-Buttons and free-text input sessions expire after 15 minutes or a restart;
-send `/admin` again. Every command and callback checks both the configured user
-ID and private chat ID. Other users' commands are silently ignored. Normal client
-messages continue to trigger Ginger replies.
+- **Set reported age:** enter an age explicitly reported by the client (1–120),
+  or `clear`. No model is called and no age is extracted from messages. It records
+  a self-report, not verified identity. Age changes cancel old queued/generated
+  replies; clearing or lowering age also clears old context. Underage ages pause
+  immediately, and changing an age does not auto-resume a paused client.
+  Unknown-age chat stays SFW. The old
+  unknown-age reply quota is removed. Underage records still trigger review.
+- **Pause / Resume:** cancel pending replies and wait for a fresh client message.
+  Resuming does not send a greeting. Existing client data is retained.
+- **Add note:** up to 1,000 characters and 50 notes per client. Notes are searchable
+  and exported, but never sent to Ginger. Command or button navigation cancels
+  pending input so notes cannot accidentally be added to the wrong client.
+- **Delete data:** requires confirmation. It clears live identity, saved details,
+  notes, context and queued replies. The chat remains paused. Backups and already
+  exported copies are separate.
+- **Export CSV:** delivered to the admin's private chat. Identity-only clients and
+  notes are included. `/export_profiles` and the local CLI export still work.
+
+Buttons and input sessions expire after 15 minutes or a restart; send `/admin`
+again. Database retries preserve their button capability and do not repeat an
+already committed action merely because rendering its result failed.
 
 Shortcuts:
 
@@ -103,90 +129,66 @@ Shortcuts:
 /cancel
 ```
 
-`/delete_profile` opens confirmation; it does not immediately delete data. If a
-client was deleted, `/resume_profile <full_chat_key>` can re-enable the known chat;
-its next message will record identity/profile information again. Unknown keys are
-rejected. `/start` is silent and only controls the admin's own direct chat. Use
-client menu buttons or the full-key shortcuts to manage other chats.
+`/delete_profile` opens confirmation. A known deleted chat can be re-enabled with
+`/resume_profile <full_chat_key>`; its next message records Telegram identity again,
+without extracting personal facts. `/start` is silent and controls only the admin's
+own direct test chat. Use client controls for other chats.
 
-No bulk outreach is sent by the menu. Opening a Telegram profile lets the admin
-choose their next action in Telegram.
+## Testing Telegram
 
-## Profiles, context and delivery
+Business reply access must be enabled. Test Business conversations from a
+separate account; owner-authored messages are ignored to prevent self-replies.
+For normal messages sent directly to the bot, set:
 
-Personal details beyond age are optional. Employment does not determine whether
-a client can chat. A numeric adult age is a self-report, not verified identity.
-Unknown-age introductions stay SFW; underage reports or the existing 12-reply
-unknown-age limit pause the conversation for admin review. Eligible adult chats
-continue on local Ginger without a separate provider's five-reply cap.
+```dotenv
+ENABLE_DIRECT_TEST_MODE=true
+```
 
-Stable preferences and boundaries survive restarts, with corrections/removals
-supported. Plans/events expire from usable memory after `PLAN_MEMORY_DAYS`
-(default 7) unless explicitly reconfirmed. Other profile changes do not refresh
-those timestamps. Client records and notes expire after `PROFILE_RETENTION_DAYS`
-(default 30) of client inactivity. Common credentials/contact strings are redacted
-best-effort; this is not a comprehensive sensitive-data filter.
+This is off by default. Admin commands work with it off. If testing from the
+admin account, send `/cancel` first to leave a pending menu search/note/age input.
+The bot sends no automatic startup greeting or privacy notice; clients initiate.
 
-The bot sends no automatic startup greeting or privacy notice. Clients initiate
-conversations. Admin resume also waits for a new client message. `/privacy` is an
-on-request admin command describing local storage.
+## Storage, migration and recovery
 
-Incoming updates and pending/generated replies use a durable SQLite inbox and
-queue. Deduplication retains the most recent 10,000 processed receipt IDs without
-message bodies. Telegram has no exactly-once send key: ambiguous timeouts or a
-crash during delivery pause the affected chat for review instead of replaying a
-possibly delivered reply. Check the Telegram chat, then resume from the menu.
+Before the first legacy schema upgrade, SQLite's backup API creates
+`*.pre-local-menu-*.sqlite3` beside the database. The supported conversation fields
+are migrated transactionally; retired payload columns are removed from the live
+conversation table and retained only in the backup. Existing identity/profile
+records and supported context are preserved. Previously paused clients remain
+paused for admin review. Prepared replies from a removed provider are cancelled.
 
-Schema migration normalizes legacy paused states to manual review; resume those
-clients explicitly. Legacy active phases become active. Supported context is
-retained, while retired payload columns are kept only in the pre-upgrade backup.
+The durable inbox and reply queue recover normal waiting/ready work on restart.
+Recent processed receipt IDs are retained without message bodies for duplicate
+protection. A timeout or crash during Telegram sending can leave delivery
+uncertain. Those chats pause for review instead of replaying a possibly sent
+message. Inspect the Telegram chat, then resume through the admin menu.
 
-Local profiles/recent context, admin notes and backups are plaintext files; keep
-filesystem access and backups private. Admin deletion clears live records, not
-backup archives or Telegram history. Old events cannot recreate deleted live data
-through a retained duplicate receipt.
+`PROFILE_RETENTION_DAYS` defaults to 30 days of client inactivity and covers live
+client records and notes. Existing temporary plans/events in saved data retain
+`PLAN_MEMORY_DAYS` (default 7). No new plans/events are extracted. Files and backups
+are plaintext; keep access private. Deleting live data does not delete backups or
+Telegram history. Common credential/contact redaction is best-effort.
 
-## Settings
+## Configuration and troubleshooting
 
-`.env.example` contains local settings and fast delivery values. Keep existing
-credentials when upgrading instead of overwriting your `.env` wholesale.
+`.env.example` contains fast-delivery values. Existing `.env` values override
+code defaults. Keep your own nonempty `SYSTEM_PROMPT` if desired; it overrides
+`SYSTEM_PROMPT_FILE`. If your custom prompt still asks personal intake questions,
+that wording can influence replies even though extraction code is removed.
 
-| Setting | Default in code | Purpose |
-| --- | --- | --- |
-| `LOCAL_MODEL_NAME` | `ginger` | Single model for chat and extraction. |
-| `LOCAL_MODEL_BASE_URL` | `http://127.0.0.1:8080/v1` | Local OpenAI-compatible server. |
-| `LOCAL_MODEL_TIMEOUT_SECONDS` | `180` | Increase to 600 for slow CPU offloading. |
-| `MODEL_CONCURRENCY` | `1` | Concurrent requests to the one local model. |
-| `WORKER_COUNT` | `2` | Reply workers; waiting jobs occupy no model slot. |
-| `MAX_PENDING_UPDATES` | `10000` | Incoming queue capacity. |
-| `MAX_PENDING_JOBS` | `1000` | Outstanding bursts/cache limit. |
-| `MAX_TURN_CHARS` | `16000` | Maximum characters in one message burst. |
-| `PROFILING_REPLY_LIMIT` | `12` | Unknown-age review threshold. |
-| `PROFILE_RETENTION_DAYS` | `30` | Client inactivity retention. |
-| `PLAN_MEMORY_DAYS` | `7` | Per-plan/event confirmation retention. |
+Model calls use `LOCAL_MODEL_BASE_URL` and `LOCAL_MODEL_NAME`. Concurrency defaults
+to one; request timeout defaults to 180 seconds and can be set to 600 for CPU
+offloading. Increasing timeout changes waiting time, not generation speed.
 
-Artificial delay/typing settings remain available. `.env.example` sets them to
-zero for fast delivery; old `.env` values still override the code defaults.
-`SYSTEM_PROMPT` overrides `SYSTEM_PROMPT_FILE`; keep your own chosen prompt.
+The warning reports safe HTTP error categories rather than arbitrary response
+bodies. Check server port/model alias for connection or model errors. Prompts,
+chat history and generated output share the context window; increase server
+context or reduce history if a large request exceeds it, balancing GPU memory.
 
-For webhook deployments, configure an HTTPS `WEBHOOK_URL` and `WEBHOOK_SECRET`
-(ASCII letters/digits/underscores/hyphens, 1–256 characters). `PORT` defaults to
-10000. Polling removes a pre-existing webhook without dropping pending updates.
-Restarting this version subscribes to button callback updates automatically.
-`/healthz` checks worker-thread liveness, not model or Telegram connectivity.
-
-## Troubleshooting extraction
-
-The detailed warning reports model, timeout and a safe upstream error category.
-For explicit context overflow, the bot retries once without old dialogue while
-preserving the extraction instructions, current profile and latest input. It does
-not automatically retry connection failures. A 2048-token server context can be
-too small for full profiles; increase context and reduce GPU layers if necessary.
-
-Run `python business_bot.py --test-profile-model` from the same folder and `.env`
-as the live bot. Match `LOCAL_MODEL_NAME` to the server alias, check its port and
-inspect the actual warning before changing settings. Slow inference can require
-more timeout; changing timeout does not make generation faster.
+For webhook hosting, set HTTPS `WEBHOOK_URL`, `WEBHOOK_SECRET` (1–256 ASCII
+letters/digits/underscores/hyphens) and optional `PORT` (default 10000). Restarting
+subscribes to callbacks. Polling removes an old webhook without dropping updates.
+`/healthz` checks worker liveness, not model/Telegram connectivity.
 
 ## Offline validation
 
@@ -194,11 +196,9 @@ more timeout; changing timeout does not make generation faster.
 python -m unittest discover -s . -v
 ```
 
-108 tests cover local-only routing for all chat stages, exact preservation of the
-existing prompt strings, profile extraction/error handling, queues/restarts,
-legacy schema backups and payload removal, private admin authorization, opaque
-buttons, search/pagination, notes/export, confirmation and deletion, pause/resume,
-transient DB retries and complete local HTTP model/Telegram menu flows.
-
-Live Telegram and your installed model were not contacted during tests. Verify
-the CLI model tests and admin menu on your installation before normal operation.
+126 tests cover the single chat generation/no automatic profile writes, removed
+extraction entrypoints, manual age controls, screenshot failure patterns, character
+prompt preservation, queue recovery, legacy backups and payload removal, private
+admin authorization, menu search/notes/deletion/export, transient DB retries and
+complete local HTTP model/Telegram menu flows. Only synthetic data and mock local
+APIs are used; live model quality and Telegram operation require your local tests.
